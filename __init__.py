@@ -83,7 +83,7 @@ class SteamManagerPlugin(NekoPluginBase):
         path = self._steam_path or steam.find_steam_path()
         if not path:
             return {"output": "未检测到 Steam 安装目录，无法读取游戏库。", "is_error": True, "error": "STEAM_NOT_FOUND"}
-        games = steam.find_game(path, keyword)
+        games = steam.find_game(path, keyword, limit=limit)
         installed = [g for g in games if g["installed"]]
         if not installed:
             return {"output": f"未找到匹配的已安装游戏（关键词：{keyword or '全部'}）。", "is_error": True, "error": "NO_MATCH"}

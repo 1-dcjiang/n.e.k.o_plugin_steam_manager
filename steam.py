@@ -182,10 +182,10 @@ def scan_games(steam_path: str, limit: int = 100) -> list[dict]:
     return games
 
 
-def find_game(steam_path: str, query: str) -> list[dict]:
+def find_game(steam_path: str, query: str, limit: int = 100) -> list[dict]:
     """按名称模糊匹配游戏（返回全部匹配项，供调用方决策）。"""
     query = (query or "").strip().lower()
-    games = scan_games(steam_path)
+    games = scan_games(steam_path, limit=limit)
     if not query:
         return games
     if query.isdigit():

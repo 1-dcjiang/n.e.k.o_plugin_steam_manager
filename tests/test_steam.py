@@ -139,6 +139,13 @@ def test_find_game_by_appid_and_name(tmp_path) -> None:
     assert find_game(steam_path, "nonexistent-game-xyz") == []
 
 
+def test_find_game_honors_limit(tmp_path) -> None:
+    from plugin.plugins.steam_manager.steam import find_game
+
+    steam_path = _make_fake_library(tmp_path, {"730": "Game A", "570": "Game B", "10": "Game C"})
+    assert len(find_game(steam_path, "", limit=2)) == 2
+
+
 # ══════════ launch_game 错误分支 ══════════
 
 
