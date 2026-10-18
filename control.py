@@ -18,10 +18,15 @@ import threading
 import time
 from collections import deque
 
-USER32 = ctypes.windll.user32
-GDI32 = ctypes.windll.gdi32
-KERNEL32 = ctypes.windll.kernel32
-PSAPI = ctypes.windll.psapi
+USER32 = GDI32 = KERNEL32 = PSAPI = None
+if os.name == "nt":
+    try:
+        USER32 = ctypes.windll.user32
+        GDI32 = ctypes.windll.gdi32
+        KERNEL32 = ctypes.windll.kernel32
+        PSAPI = ctypes.windll.psapi
+    except (AttributeError, OSError):
+        USER32 = GDI32 = KERNEL32 = PSAPI = None
 
 # ══════════ Win32 常量 ══════════
 
@@ -78,7 +83,9 @@ def _safe_call(fn, *args, default=None):
 
 
 def get_foreground_window_info() -> dict | None:
-    """返回前台窗口信息：{title, pid, process, rect, ts}；无窗口返回 None。"""
+    """返回前台窗口信息：{title, pid, process, rect, ts}；无窗口或非 Windows 返回 None。"""
+    if USER32 is None:
+        return None
     hwnd = USER32.GetForegroundWindow()
     if not hwnd:
         return None
@@ -103,7 +110,7 @@ def get_foreground_window_info() -> dict | None:
 
 
 def _process_name(pid: int) -> str:
-    if not pid:
+    if not pid or KERNEL32 is None:
         return ""
     handle = KERNEL32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
@@ -125,7 +132,9 @@ def _process_name(pid: int) -> str:
 
 
 def capture_window_bmp(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
-    """截取窗口所在屏幕区域，保存为 BMP，返回文件路径；失败返回 None。"""
+    """截取窗口所在屏幕区域，保存为 BMP，返回文件路径；失败或非 Windows 返回 None。"""
+    if USER32 is None or GDI32 is None:
+        return None
     left, top, right, bottom = info["rect"]
     width = max(1, right - left)
     height = max(1, bottom - top)
@@ -192,7 +201,9 @@ def _screen_size() -> tuple[int, int]:
 
 
 def mouse_click_abs(screen_x: int, screen_y: int) -> None:
-    """在屏幕绝对坐标点击左键。"""
+    """在屏幕绝对坐标点击左键；非 Windows 为 no-op。"""
+    if USER32 is None:
+        return
     sw, sh = _screen_size()
     dx = int(screen_x * 65535 // max(1, sw - 1))
     dy = int(screen_y * 65535 // max(1, sh - 1))
@@ -203,7 +214,9 @@ def mouse_click_abs(screen_x: int, screen_y: int) -> None:
 
 
 def press_key(vk: int) -> None:
-    """按下并抬起一个虚拟键。"""
+    """按下并抬起一个虚拟键；非 Windows 为 no-op。"""
+    if USER32 is None:
+        return
     extra = ctypes.c_ulong(0)
     USER32.keybd_event(vk, 0, 0, extra)
     USER32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, extra)
