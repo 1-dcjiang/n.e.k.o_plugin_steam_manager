@@ -13,6 +13,7 @@ from plugin.sdk.plugin import (
     lifecycle,
     llm_tool,
     neko_plugin,
+    plugin_entry,
 )
 
 from . import control, steam
@@ -319,6 +320,90 @@ class SteamManagerPlugin(NekoPluginBase):
             self._state.note_event("action", f"text {text}")
             return {"output": f"已输入文本：{text}。", "is_error": False}
         return {"output": "action 无效：可选 click / key / text。", "is_error": True, "error": "BAD_ACTION"}
+
+    # ══════════ 自动路由入口（plugin_entry：TaskExecutor 评估可见） ══════════
+    # v0.2.0 只注册了 llm_tool、无 plugin_entry，导致市场面板"入口点: 0"、
+    # 评估侧无法路由到本插件（Steam 管理与游戏助手功能实际不可用）。
+    # v0.2.1 注册 run 通用入口修复（方法名不能以下划线开头，bili_viewer v0.6.22 教训）。
+
+    @plugin_entry(
+        id="run",
+        name="Steam管理",
+        description=(
+            "Steam管理（steam_manager）：管理本地 Steam 客户端与游戏库，并充当游戏助手。"
+            "用户说'Steam 开着吗/我 Steam 里有什么游戏/打开/启动 <游戏>/现在游戏什么情况/截个图看看/帮我盯着游戏/"
+            "让 YUI 接管/你来玩/停止接管'等 Steam 与游戏相关请求时使用。"
+            "操作：status（查客户端状态与路径）/ list（列游戏库，可按名称过滤）/ launch（启动游戏，需精确名称或 AppID）/ "
+            "capture（截取当前游戏画面）/ watch（开启/关闭后台画面监控）/ summary（汇总局面与行为时间线）/ "
+            "control（开启/交还键鼠接管，需用户显式授权且仅作用于前台游戏窗口）/ action（click/key/text 操作，需先授权）。"
+            "安全边界：只读本地库元数据；键鼠接管默认关闭、必须用户明确授权，仅作用于当前前台游戏窗口，"
+            "不读取账号与凭据。回复纪律：直接给出查询结果或操作确认，不加多余话术，不编造游戏状态。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "操作类型：status / list / launch / capture / watch / summary / control / action",
+                },
+                "game": {"type": "string", "description": "启动游戏：名称或 AppID（action=launch 时用）"},
+                "keyword": {"type": "string", "description": "列表过滤关键词（action=list 时用）"},
+                "limit": {"type": "integer", "description": "列表条数上限（action=list 时用）"},
+                "on": {"type": "boolean", "description": "watch / control 的开关：true 开，false 关"},
+                "interval": {"type": "integer", "description": "watch 的截帧间隔秒数"},
+                "click_x": {"type": "integer", "description": "action=click 的窗口相对 X（0-1000）"},
+                "click_y": {"type": "integer", "description": "action=click 的窗口相对 Y（0-1000）"},
+                "key": {"type": "string", "description": "action=key 的单字母或虚拟键码"},
+                "text": {"type": "string", "description": "action=text 的 ASCII 文本"},
+            },
+        },
+        timeout=30.0,
+    )
+    async def entry_run(self, **kwargs):
+        params = kwargs.get("parameters") or {}
+        action = str(kwargs.get("action") or params.get("action") or "").strip().lower()
+        game = str(kwargs.get("game") or params.get("game") or "")
+        keyword = str(kwargs.get("keyword") or params.get("keyword") or "")
+        try:
+            limit = int(kwargs.get("limit") or params.get("limit") or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        on = bool(kwargs.get("on", params.get("on", False)))
+        try:
+            interval = int(kwargs.get("interval") or params.get("interval") or 0)
+        except (TypeError, ValueError):
+            interval = 0
+        try:
+            click_x = int(kwargs.get("click_x") or params.get("click_x") or 0)
+            click_y = int(kwargs.get("click_y") or params.get("click_y") or 0)
+        except (TypeError, ValueError):
+            click_x, click_y = 0, 0
+        key = str(kwargs.get("key") or params.get("key") or "")
+        text = str(kwargs.get("text") or params.get("text") or "")
+        if action in ("status", ""):
+            return await self.steam_status()
+        if action in ("list", "games"):
+            return await self.list_games(keyword=keyword, limit=limit, parameters={})
+        if action in ("launch", "start"):
+            return await self.launch_game(game=game, parameters={})
+        if action in ("capture", "screenshot"):
+            return await self.game_capture()
+        if action in ("watch", "monitor"):
+            return await self.watch_game(on=on, interval=interval, parameters={})
+        if action in ("summary", "state"):
+            return await self.game_state_summary()
+        if action in ("control", "take_control"):
+            return await self.take_control(on=on, parameters={})
+        if action in ("action", "operate"):
+            return await self.game_action(
+                action=str(params.get("sub_action") or params.get("act") or ""),
+                x=click_x, y=click_y, key=key, text=text, parameters={},
+            )
+        return {
+            "output": "请指定操作：status/list/launch/capture/watch/summary/control/action。",
+            "is_error": True,
+            "error": "NO_ACTION",
+        }
 
 
 def _parse_vk(key: str) -> int | None:
