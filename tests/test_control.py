@@ -155,3 +155,21 @@ def test_write_bmp_header_and_size(tmp_path) -> None:
     file_size = len(data)
     # 行 4px*3B=12 → 对齐 12；2 行 → 54 + 24 = 78
     assert file_size == 54 + 12 * 2
+
+# ══════════ v0.3.1：帧目录清理回归测试 ══════════
+
+
+def test_cleanup_old_frames_keeps_recent(tmp_path, monkeypatch) -> None:
+    """FrameWatcher 定期清理：只保留最近 keep 个帧文件，防止磁盘膨胀。"""
+    from plugin.plugins.steam_manager import control
+
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    for i in range(1, 11):
+        (frame_dir / f"frame_{i:04d}.bmp").write_bytes(b"\x00" * 10)
+    monkeypatch.setattr(control, "_FRAME_DIR", str(frame_dir))
+    state = control.ControlState()
+    watcher = control.FrameWatcher(state, interval=9.0)
+    watcher._cleanup_old_frames(keep=3)
+    remaining = sorted(f.name for f in frame_dir.iterdir())
+    assert remaining == ["frame_0008.bmp", "frame_0009.bmp", "frame_0010.bmp"]

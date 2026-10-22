@@ -192,20 +192,25 @@ def scan_games(steam_path: str, limit: int = 100) -> list[dict]:
                     "state": _state_flags_text(flags),
                 }
             )
-            if len(games) >= limit:
+            if limit > 0 and len(games) >= limit:
                 return games
     return games
 
 
 def find_game(steam_path: str, query: str, limit: int = 100) -> list[dict]:
-    """按名称模糊匹配游戏（返回全部匹配项，供调用方决策）。"""
+    """按名称模糊匹配游戏（先全量扫描、后过滤，再按 limit 截断；返回全部匹配项，供调用方决策）。
+
+    v0.3.1：修复 limit 截断顺序——此前先截断后过滤，游戏库超 limit 时
+    关键词匹配项可能被截掉导致误报"未找到"。
+    """
     query = (query or "").strip().lower()
-    games = scan_games(steam_path, limit=limit)
-    if not query:
-        return games
-    if query.isdigit():
-        return [g for g in games if g["app_id"] == query]
-    return [g for g in games if query in g["name"].lower()]
+    games = scan_games(steam_path, limit=0)
+    if query:
+        if query.isdigit():
+            games = [g for g in games if g["app_id"] == query]
+        else:
+            games = [g for g in games if query in g["name"].lower()]
+    return games[:limit] if limit > 0 else games
 
 
 # ══════════ 启动游戏 ══════════
@@ -376,10 +381,27 @@ def account_info(api_key: str, steam_id: str) -> dict | None:
 # ══════════ 好友列表（Steam Web API，需 Key） ══════════
 
 
+def _summaries_in_chunks(api_key: str, ids: list[str], chunk: int = 100) -> dict[str, dict]:
+    """GetPlayerSummaries 每次最多 100 个 steamid，超过必须分批（v0.3.1 修复）。"""
+    info_map: dict[str, dict] = {}
+    for start in range(0, len(ids), chunk):
+        batch = ids[start:start + chunk]
+        try:
+            sdata = _http_get_json(
+                "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+                f"?key={urllib.parse.quote(api_key)}&steamids={urllib.parse.quote(','.join(batch))}"
+            )
+            for p in (sdata.get("response") or {}).get("players") or []:
+                info_map[str(p.get("steamid"))] = p
+        except (OSError, ValueError):
+            pass
+    return info_map
+
+
 def friend_list(api_key: str, steam_id: str, limit: int = 200) -> list[dict]:
     """查询指定账号的好友列表，合并每个好友的昵称/状态/头像。
 
-    需 Steam Web API Key；好友超 100 人时分批获取概要。
+    需 Steam Web API Key；好友超 100 人时自动分批获取概要（v0.3.1）。
     """
     steam_id = (steam_id or "").strip()
     if not api_key or not steam_id:
@@ -390,18 +412,8 @@ def friend_list(api_key: str, steam_id: str, limit: int = 200) -> list[dict]:
     )
     data = _http_get_json(url)
     friends = ((data.get("friendslist") or {}).get("friends")) or []
-    ids = ",".join(str(f.get("steamid") or "") for f in friends if f.get("steamid"))
-    info_map: dict[str, dict] = {}
-    if ids:
-        try:
-            sdata = _http_get_json(
-                "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
-                f"?key={urllib.parse.quote(api_key)}&steamids={urllib.parse.quote(ids)}"
-            )
-            for p in (sdata.get("response") or {}).get("players") or []:
-                info_map[str(p.get("steamid"))] = p
-        except (OSError, ValueError):
-            pass
+    ids = [str(f.get("steamid") or "") for f in friends if f.get("steamid")]
+    info_map = _summaries_in_chunks(api_key, ids)
     out: list[dict] = []
     for f in friends[:limit]:
         sid = str(f.get("steamid") or "")

@@ -248,3 +248,56 @@ def test_open_app_not_installed_opens_store(monkeypatch) -> None:
     assert "商店页" in result["output"]
     assert len(opened) == 1
     assert "steam://openurl/https://store.steampowered.com/app/730" in opened[0]
+
+# ══════════ v0.3.1：复查修复回归测试 ══════════
+
+
+def test_scan_games_limit_zero_returns_all(tmp_path) -> None:
+    """scan_games(limit=0) 必须返回全部（此前 limit=0 时首条即返回截断）。"""
+    from plugin.plugins.steam_manager.steam import scan_games
+
+    steam_path = _make_fake_library(tmp_path, {"730": "A", "570": "B", "10": "C"})
+    games = scan_games(steam_path, limit=0)
+    assert len(games) == 3
+
+
+def test_find_game_filters_before_truncating(tmp_path) -> None:
+    """库超 limit 时，关键词匹配项不再被截掉（先全扫后过滤再截断）。"""
+    from plugin.plugins.steam_manager.steam import find_game
+
+    steam_path = _make_fake_library(tmp_path, {"730": "Game A", "570": "Game B", "10": "Target Hit", "20": "D", "30": "E"})
+    # 关键词在库内且匹配项位于扫描较后位置；limit=3 不应截掉它
+    matched = find_game(steam_path, "target", limit=3)
+    assert len(matched) == 1
+    assert matched[0]["name"] == "Target Hit"
+
+
+def test_friend_list_batches_over_100(monkeypatch) -> None:
+    """好友 >100 时 GetPlayerSummaries 必须分批（每次 ≤100），不再单次超限。"""
+    from plugin.plugins.steam_manager import steam
+
+    fake_ids = [f"7656119{10000000 + i}" for i in range(150)]
+    calls: list[str] = []
+
+    def fake_get(url, referer=None, timeout=15.0):
+        calls.append(url)
+        if "GetFriendList" in url:
+            return {"friendslist": {"friends": [{"steamid": sid} for sid in fake_ids]}}
+        # GetPlayerSummaries：返回本批 id 的概要
+        start = url.index("steamids=") + len("steamids=")
+        ids_part = url[start:]
+        import urllib.parse as up
+        ids = up.unquote(ids_part).split(",")
+        return {"response": {"players": [{"steamid": sid, "personaname": f"P{sid[-4:]}"} for sid in ids]}}
+
+    monkeypatch.setattr(steam, "_http_get_json", fake_get)
+    friends = steam.friend_list("key", "76561190000000000")
+    assert len(friends) == 150
+    assert len(calls) == 3  # 1 次好友列表 + 2 次概要（100+50 分批）
+    assert all("steamids=" in c for c in calls[1:])
+    # 每批不得超过 100 个 steamid
+    for c in calls[1:]:
+        ids_part = c[c.index("steamids=") + len("steamids="):]
+        import urllib.parse as up
+        assert len(up.unquote(ids_part).split(",")) <= 100
+    assert all(f["name"].startswith("P") for f in friends)

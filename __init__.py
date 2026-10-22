@@ -482,6 +482,8 @@ class SteamManagerPlugin(NekoPluginBase):
         except (TypeError, ValueError):
             interval = 3
         if on:
+            # v0.3.1 修复：重复开启时先停旧 watcher，避免多线程并存疯狂截图
+            self._watcher.stop()
             self._watcher = control.FrameWatcher(self._state, interval=interval)
             self._watcher.start()
             self._state.enable_watch()
@@ -653,6 +655,7 @@ class SteamManagerPlugin(NekoPluginBase):
                 "click_x": {"type": "integer", "description": "action=click 的窗口相对 X（0-1000）"},
                 "click_y": {"type": "integer", "description": "action=click 的窗口相对 Y（0-1000）"},
                 "key": {"type": "string", "description": "action=key 的单字母或虚拟键码"},
+                "sub_action": {"type": "string", "description": "action=action 时的子操作：click / key / text（v0.3.1 修复入口可达性）"},
             },
         },
         timeout=30.0,
@@ -677,6 +680,7 @@ class SteamManagerPlugin(NekoPluginBase):
         except (TypeError, ValueError):
             click_x, click_y = 0, 0
         key = str(kwargs.get("key") or params.get("key") or "")
+        sub_action = str(kwargs.get("sub_action") or params.get("sub_action") or params.get("act") or "")
         steam_id = str(kwargs.get("steam_id") or params.get("steam_id") or "")
         name_filter = str(kwargs.get("name_filter") or params.get("name_filter") or "")
         friend = str(kwargs.get("friend") or params.get("friend") or "")
@@ -709,7 +713,7 @@ class SteamManagerPlugin(NekoPluginBase):
             return await self.take_control(on=on, parameters={})
         if action in ("action", "operate"):
             return await self.game_action(
-                action=str(params.get("sub_action") or params.get("act") or ""),
+                action=sub_action,
                 x=click_x, y=click_y, key=key, text=text, parameters={},
             )
         return {

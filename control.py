@@ -348,4 +348,23 @@ class FrameWatcher:
                 if path:
                     self._state.note_frame(info, path)
                     self._state.note_event("frame", f"{info.get('title', '')} / {info.get('process', '')}")
+            self._cleanup_old_frames()
             self._stop.wait(self._interval)
+
+    def _cleanup_old_frames(self, keep: int = 40) -> None:
+        """v0.3.1 修复：帧目录无上限膨胀（BMP 每帧数 MB，监控数小时可达数 GB）。
+
+        每次循环清理一次：只保留最近 keep 个帧文件，其余删除。
+        """
+        try:
+            files = sorted(
+                os.path.join(_FRAME_DIR, f) for f in os.listdir(_FRAME_DIR)
+                if f.startswith("frame_") and f.endswith(".bmp")
+            )
+        except OSError:
+            return
+        for old in files[:-keep]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
