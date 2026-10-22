@@ -4,18 +4,32 @@
 - 检测 Steam 客户端安装路径与运行状态
 - 解析本地游戏库（libraryfolders.vdf + appmanifest_*.acf）
 - 通过 steam.exe -applaunch 启动已安装游戏
+- 读取本地最近登录账号元数据（config/loginusers.vdf，仅昵称/SteamID）
+- 经 Steam Web API 查询账户信息、好友列表（需 STEAM_API_KEY）
+- 经 steamcommunity 网页聊天接口回复好友（需 steam_cookie.txt）
+- 经 Steam Store 公开 API 查询游戏价格与促销（无需凭证）
+- 打开任意 Steam 应用：已安装直接启动，未安装打开商店页
 
 安全边界：只读本地库元数据 + 按用户明确指令启动游戏；
-不读取账号、凭据、云存档等敏感数据；启动前必须确认游戏存在。
+账号/好友/发消息仅在使用户授权的场景执行，凭据（API Key / cookie）
+只读取不输出；不读取密码、令牌、云存档等敏感数据。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+
+_PERSONA_STATE = {0: "离线", 1: "在线", 2: "离开", 3: "忙碌", 4: "打盹", 5: "想交易", 6: "想玩"}
 
 # 常见 Steam 安装路径（注册表失败时的兜底）
 _FALLBACK_PATHS = (
@@ -222,3 +236,367 @@ def launch_game(steam_path: str, app_id: str) -> dict:
         }
     except OSError as exc:
         return {"ok": False, "error": "LAUNCH_FAILED", "output": f"启动游戏失败：{exc}"}
+
+
+# ══════════ 可选凭证（只读，不输出内容） ══════════
+
+
+def api_key() -> str:
+    """读取 Steam Web API Key：环境变量 STEAM_API_KEY 或插件目录 steam_api_key.txt。"""
+    key = os.environ.get("STEAM_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "steam_api_key.txt"), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def community_cookie() -> str:
+    """读取 steamcommunity 登录 cookie：环境变量 STEAM_COOKIE 或插件目录 steam_cookie.txt。
+
+    需包含 sessionid（发消息必需）与 steamLoginSecure/steamLogin（身份）。
+    """
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "steam_cookie.txt"), encoding="utf-8") as fh:
+            cookie = fh.read().strip()
+        if cookie:
+            return cookie
+    except OSError:
+        pass
+    return os.environ.get("STEAM_COOKIE", "").strip()
+
+
+def _cookie_value(cookie_text: str, name: str) -> str:
+    """从 Cookie 文本中提取指定字段值。"""
+    for part in (cookie_text or "").split(";"):
+        part = part.strip()
+        if part.startswith(name + "="):
+            return part[len(name) + 1:].strip().strip('"')
+    return ""
+
+
+# ══════════ 本地账号（config/loginusers.vdf） ══════════
+
+
+def read_local_account(steam_path: str | None) -> dict | None:
+    """读取本地最近登录的 Steam 账号（SteamID/昵称/最近登录时间）。
+
+    仅读取昵称与 SteamID 等非敏感元数据；不读取密码、令牌、cookies。
+    """
+    if not steam_path:
+        return None
+    vdf = os.path.join(steam_path, "config", "loginusers.vdf")
+    if not os.path.isfile(vdf):
+        return None
+    try:
+        with open(vdf, encoding="utf-8", errors="replace") as fh:
+            data = parse_vdf(fh.read())
+    except OSError:
+        return None
+    users = data.get("users", {})
+    best: dict | None = None
+    for sid, meta in users.items():
+        if not isinstance(meta, dict):
+            continue
+        rec = {
+            "steam_id": str(sid),
+            "name": str(meta.get("PersonaName") or ""),
+            "most_recent": 0,
+        }
+        try:
+            rec["most_recent"] = int(meta.get("mostrecent") or 0)
+        except (TypeError, ValueError):
+            rec["most_recent"] = 0
+        if best is None or rec["most_recent"] > best["most_recent"]:
+            best = rec
+    return best
+
+
+# ══════════ HTTP 工具 ══════════
+
+
+def _http_get_json(url: str, referer: str | None = None, timeout: float = 15.0) -> dict:
+    """GET 并解析 JSON。网络或解析失败抛 OSError/ValueError。"""
+    headers = {
+        "User-Agent": _UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise OSError(f"HTTP {exc.code}") from exc
+    return json.loads(raw)
+
+
+# ══════════ 账户信息（Steam Web API，需 Key） ══════════
+
+
+def account_info(api_key: str, steam_id: str) -> dict | None:
+    """查询指定 SteamID 的账户概要（昵称/状态/头像/国家）。
+
+    返回 None 表示账号不存在或接口失败。需 Steam Web API Key。
+    """
+    steam_id = (steam_id or "").strip()
+    if not api_key or not steam_id:
+        return None
+    url = (
+        "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+        f"?key={urllib.parse.quote(api_key)}&steamids={urllib.parse.quote(steam_id)}"
+    )
+    data = _http_get_json(url)
+    players = (data.get("response") or {}).get("players") or []
+    if not players:
+        return None
+    p = players[0]
+    state = int(p.get("personastate", 0) or 0)
+    return {
+        "steam_id": str(p.get("steamid") or steam_id),
+        "name": str(p.get("personaname") or ""),
+        "state": _PERSONA_STATE.get(state, str(state)),
+        "avatar": str(p.get("avatarfull") or ""),
+        "country": str(p.get("loccountrycode") or ""),
+        "url": str(p.get("profileurl") or ""),
+    }
+
+
+# ══════════ 好友列表（Steam Web API，需 Key） ══════════
+
+
+def friend_list(api_key: str, steam_id: str, limit: int = 200) -> list[dict]:
+    """查询指定账号的好友列表，合并每个好友的昵称/状态/头像。
+
+    需 Steam Web API Key；好友超 100 人时分批获取概要。
+    """
+    steam_id = (steam_id or "").strip()
+    if not api_key or not steam_id:
+        return []
+    url = (
+        "https://api.steampowered.com/ISteamUser/GetFriendList/v1/"
+        f"?key={urllib.parse.quote(api_key)}&steamid={urllib.parse.quote(steam_id)}&relationship=friend"
+    )
+    data = _http_get_json(url)
+    friends = ((data.get("friendslist") or {}).get("friends")) or []
+    ids = ",".join(str(f.get("steamid") or "") for f in friends if f.get("steamid"))
+    info_map: dict[str, dict] = {}
+    if ids:
+        try:
+            sdata = _http_get_json(
+                "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+                f"?key={urllib.parse.quote(api_key)}&steamids={urllib.parse.quote(ids)}"
+            )
+            for p in (sdata.get("response") or {}).get("players") or []:
+                info_map[str(p.get("steamid"))] = p
+        except (OSError, ValueError):
+            pass
+    out: list[dict] = []
+    for f in friends[:limit]:
+        sid = str(f.get("steamid") or "")
+        if not sid:
+            continue
+        p = info_map.get(sid) or {}
+        state = int(p.get("personastate", 0) or 0)
+        out.append(
+            {
+                "steam_id": sid,
+                "name": str(p.get("personaname") or ""),
+                "state": _PERSONA_STATE.get(state, str(state)),
+                "avatar": str(p.get("avatarfull") or ""),
+            }
+        )
+    return out
+
+
+# ══════════ 回复好友（steamcommunity 网页聊天，需 cookie） ══════════
+
+
+def send_friend_message(cookie: str, my_steam_id: str, friend_steam_id: str, text: str) -> dict:
+    """通过 steamcommunity 网页聊天接口给好友发一条消息。
+
+    cookie 需包含 sessionid（与 steamLoginSecure/steamLogin）。消息最长 500 字。
+    返回 {"ok": True, ...} 信封；失败抛 ValueError。
+    """
+    text = (text or "").strip()
+    my_steam_id = (my_steam_id or "").strip()
+    friend_steam_id = (friend_steam_id or "").strip()
+    if not text:
+        raise ValueError("消息内容为空")
+    if len(text) > 500:
+        raise ValueError("消息最长 500 个字符")
+    if not my_steam_id or not friend_steam_id:
+        raise ValueError("缺少自己的或对方的好友 SteamID")
+    session = _cookie_value(cookie, "sessionid")
+    if not session:
+        raise ValueError("cookie 缺少 sessionid（请重新登录 steamcommunity 后更新 steam_cookie.txt）")
+    body = urllib.parse.urlencode(
+        {
+            "steamid_first": friend_steam_id,
+            "steamid": my_steam_id,
+            "body": text,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        "https://steamcommunity.com/chat/sendmessage",
+        data=body,
+        headers={
+            "User-Agent": _UA,
+            "Referer": "https://steamcommunity.com/chat/",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://steamcommunity.com",
+            "Cookie": cookie,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15.0) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"发送失败（HTTP {exc.code}）") from exc
+    stripped = raw.strip()
+    if stripped.startswith("["):
+        try:
+            arr = json.loads(stripped)
+            if arr and str(arr[0]) in ("1", "1"):
+                return {"ok": True, "to": friend_steam_id, "text": text}
+        except ValueError:
+            pass
+    raise ValueError(f"发送失败：{stripped[:120]}")
+
+
+# ══════════ 价格与促销（Steam Store 公开 API，无需凭证） ══════════
+
+
+def _final_fen(price: dict | None) -> int | None:
+    """取 price_overview/价格对象的 final（单位分）；无效返回 None。"""
+    if not price or not isinstance(price, dict):
+        return None
+    final = price.get("final")
+    try:
+        return int(final)
+    except (TypeError, ValueError):
+        return None
+
+
+def search_store(query: str, limit: int = 5) -> list[dict]:
+    """按名称在 Steam 商店搜索游戏（国区，简体中文）。返回 app_id/名称/价格/折扣。"""
+    query = (query or "").strip()
+    if not query:
+        return []
+    url = (
+        "https://store.steampowered.com/api/storesearch/"
+        f"?term={urllib.parse.quote(query)}&cc=cn&l=schinese"
+    )
+    data = _http_get_json(url, referer="https://store.steampowered.com/")
+    items = data.get("items") or []
+    out: list[dict] = []
+    for it in items[:limit]:
+        price = it.get("price") or {}
+        final = _final_fen(price)
+        original = None
+        try:
+            original = int(price.get("original")) if price.get("original") is not None else None
+        except (TypeError, ValueError):
+            original = None
+        out.append(
+            {
+                "app_id": str(it.get("id") or ""),
+                "name": str(it.get("name") or ""),
+                "type": str(it.get("type") or ""),
+                "price_cny": (final / 100) if final is not None else None,
+                "original_cny": (original / 100) if original is not None else None,
+                "discount": int(price.get("discount_percent") or 0) if price.get("discount_percent") is not None else 0,
+            }
+        )
+    return out
+
+
+def app_price(appid: str) -> dict | None:
+    """查询单个 AppID 的国区价格与折扣。返回 None 表示不存在或不可用。"""
+    appid = (appid or "").strip()
+    if not appid.isdigit():
+        return None
+    url = (
+        "https://store.steampowered.com/api/appdetails"
+        f"?appids={appid}&cc=cn&l=schinese&filters=basic,price_overview"
+    )
+    data = _http_get_json(url, referer="https://store.steampowered.com/")
+    entry = data.get(appid) or {}
+    if not entry.get("success"):
+        return None
+    d = entry.get("data") or {}
+    po = d.get("price_overview") or {}
+    final = _final_fen(po)
+    original = None
+    try:
+        original = int(po.get("original")) if po.get("original") is not None else None
+    except (TypeError, ValueError):
+        original = None
+    free = bool(po.get("is_free")) or final is None
+    return {
+        "app_id": appid,
+        "name": str(d.get("name") or ""),
+        "price_cny": (final / 100) if final is not None else None,
+        "original_cny": (original / 100) if original is not None else None,
+        "discount": int(po.get("discount_percent") or 0) if po.get("discount_percent") is not None else 0,
+        "free": free,
+    }
+
+
+def store_promotions(limit: int = 15) -> list[dict]:
+    """查询 Steam 商店当前特惠/促销游戏（国区首页特色分类）。"""
+    url = "https://store.steampowered.com/api/featuredcategories?cc=cn&l=schinese"
+    data = _http_get_json(url, referer="https://store.steampowered.com/")
+    specials = ((data.get("specials") or {}).get("items")) or []
+    out: list[dict] = []
+    for it in specials[:limit]:
+        final = _final_fen({"final": it.get("final_price")})
+        original = None
+        try:
+            original = int(it.get("original_price")) if it.get("original_price") is not None else None
+        except (TypeError, ValueError):
+            original = None
+        out.append(
+            {
+                "app_id": str(it.get("id") or ""),
+                "name": str(it.get("name") or ""),
+                "price_cny": (final / 100) if final is not None else None,
+                "original_cny": (original / 100) if original is not None else None,
+                "discount": int(it.get("discount_percent") or 0) if it.get("discount_percent") is not None else 0,
+            }
+        )
+    return out
+
+
+# ══════════ 打开任意 Steam 应用 ══════════
+
+
+def open_app(steam_path: str | None, app_id: str, installed: bool) -> dict:
+    """打开任意 Steam 应用：已安装直接启动；未安装打开商店页。
+
+    用于打开其他开发者制作/未安装的游戏或应用。
+    """
+    app_id = (app_id or "").strip()
+    if not app_id.isdigit():
+        return {"ok": False, "error": "INVALID_APP_ID", "output": "AppID 必须是数字。"}
+    if installed:
+        if not steam_path:
+            return {"ok": False, "error": "STEAM_NOT_FOUND", "output": "未检测到 Steam 安装目录，无法启动。"}
+        return launch_game(steam_path, app_id)
+    try:
+        urllib.request.urlopen(
+            f"steam://openurl/https://store.steampowered.com/app/{app_id}",
+            timeout=3.0,
+        )
+    except (OSError, urllib.error.URLError):
+        pass  # steam:// 协议由系统接管，请求失败不代表未打开
+    return {
+        "ok": True,
+        "output": f"游戏（AppID {app_id}）未安装，已打开 Steam 商店页；在页面点击「安装」即可下载后游玩。",
+    }

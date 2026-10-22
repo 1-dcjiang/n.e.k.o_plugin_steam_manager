@@ -163,3 +163,84 @@ def test_launch_game_exe_missing(tmp_path) -> None:
     result = launch_game(str(tmp_path), "730")
     assert result["ok"] is False
     assert result["error"] == "STEAM_EXE_NOT_FOUND"
+
+
+# ══════════ v0.3.0：凭证 / 本地账号 / 价格 / 打开应用 ══════════
+
+
+def test_cookie_value_extract() -> None:
+    from plugin.plugins.steam_manager.steam import _cookie_value
+
+    cookie = 'sessionid=abc123; steamLoginSecure=7656119%7C%7Ctoken; foo="bar"'
+    assert _cookie_value(cookie, "sessionid") == "abc123"
+    assert _cookie_value(cookie, "steamLoginSecure") == "7656119%7C%7Ctoken"
+    assert _cookie_value(cookie, "missing") == ""
+
+
+def test_read_local_account(tmp_path) -> None:
+    from plugin.plugins.steam_manager.steam import read_local_account
+
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "loginusers.vdf").write_text(
+        '"users"\n'
+        '{\n'
+        '\t"76561198000000001"\n'
+        '\t{\n'
+        '\t\t"PersonaName"\t\t"Player One"\n'
+        '\t\t"mostrecent"\t\t"2"\n'
+        '\t\t"RememberPassword"\t\t"1"\n'
+        '\t}\n'
+        '\t"76561198000000002"\n'
+        '\t{\n'
+        '\t\t"PersonaName"\t\t"Player Two"\n'
+        '\t\t"mostrecent"\t\t"1"\n'
+        '\t}\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    account = read_local_account(str(tmp_path))
+    assert account is not None
+    assert account["steam_id"] == "76561198000000001"
+    assert account["name"] == "Player One"
+    assert account["most_recent"] == 2
+
+
+def test_read_local_account_missing_file(tmp_path) -> None:
+    from plugin.plugins.steam_manager.steam import read_local_account
+
+    assert read_local_account(str(tmp_path)) is None
+    assert read_local_account(None) is None
+
+
+def test_final_fen_conversion() -> None:
+    from plugin.plugins.steam_manager.steam import _final_fen
+
+    assert _final_fen({"final": 4999}) == 4999
+    assert _final_fen({"final": None}) is None
+    assert _final_fen(None) is None
+    assert _final_fen({"final": "abc"}) is None
+
+
+def test_open_app_invalid_appid() -> None:
+    from plugin.plugins.steam_manager.steam import open_app
+
+    result = open_app("C:\\Steam", "not-a-number", False)
+    assert result["ok"] is False
+    assert result["error"] == "INVALID_APP_ID"
+
+
+def test_open_app_installed_no_steam() -> None:
+    from plugin.plugins.steam_manager.steam import open_app
+
+    result = open_app(None, "730", True)
+    assert result["ok"] is False
+    assert result["error"] == "STEAM_NOT_FOUND"
+
+
+def test_open_app_not_installed_opens_store() -> None:
+    from plugin.plugins.steam_manager.steam import open_app
+
+    result = open_app(None, "730", False)
+    assert result["ok"] is True
+    assert "商店页" in result["output"]
