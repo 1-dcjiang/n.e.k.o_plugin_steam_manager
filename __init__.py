@@ -437,8 +437,9 @@ class SteamManagerPlugin(NekoPluginBase):
             "给 Steam 配 API Key/好友功能用不了/回复好友用不了/自动配置一下'或插件提示缺少凭证时。"
             "三种模式（mode）：skip=不配置（保留本地库/查价/促销能力，好友/发消息不可用）；"
             "yui=拿到凭证由 YUI 配置：把 API Key 传 api_key、cookie 传 cookie 参数，写入插件目录并立即验证；"
-            "auto=全自动：有凭证同样写入验证，没有任何凭证时自动打开官方获取页并给出指引（仍需用户把 Key 复制回来，"
-            "验证这一步由助手协助）。验证通过才报告配置成功；验证失败必须如实说明原因，不得声称配置完成。"
+            "auto=全自动：有凭证同样写入验证；没有任何凭证时先自动探测本机 Chrome/Edge 里的 steamcommunity 登录 Cookie"
+            "（找到即写入并验证），探测不到再打开官方获取页并给出指引（验证由助手协助）。验证通过才报告配置成功；"
+            "验证失败必须如实说明原因，不得声称配置完成。"
             "安全：Key/Cookie 只写入本地插件目录并验证有效性，不回显内容。"
         ),
         parameters={
@@ -487,22 +488,57 @@ class SteamManagerPlugin(NekoPluginBase):
         if not api_key and not cookie:
             if mode == "yui":
                 return {
-                    "output": "未收到凭证（mode=yui 需要你提供 api_key 或 cookie 参数）。可先调用 auto 模式打开获取页。",
+                    "output": "未收到凭证（mode=yui 需要你提供 api_key 或 cookie 参数）。可调用 auto 模式自动探测或打开获取页。",
                     "is_error": True,
                     "error": "NO_CREDENTIAL",
                 }
-            # auto 且无凭证：打开官方获取页 + 指引
+            # auto：先自动探测浏览器里的 steamcommunity 登录 cookie
+            probe = steam.probe_browser_cookies()
+            if probe["found"]:
+                try:
+                    steam.save_community_cookie(
+                        "sessionid=" + probe["sessionid"] + "; steamLoginSecure=" + probe["steam_login_secure"]
+                        if probe["steam_login_secure"]
+                        else "sessionid=" + probe["sessionid"] + "; steamLogin=" + probe["steam_login"]
+                    )
+                    ok, msg = steam.validate_community_cookie(
+                        "sessionid=" + probe["sessionid"] + "; steamLoginSecure=" + probe["steam_login_secure"]
+                        if probe["steam_login_secure"]
+                        else "sessionid=" + probe["sessionid"] + "; steamLogin=" + probe["steam_login"]
+                    )
+                    if ok:
+                        return {
+                            "output": "已从浏览器自动检测到 Steam 登录 Cookie（来源：" + probe["browser"] + "）并写入验证通过：" + msg + "\n" + _cred_status_line(steam.credentials_status()),
+                            "is_error": False,
+                            "result": {"mode": "auto", "source": "browser_probe", **steam.credentials_status()},
+                        }
+                    return {
+                        "output": "检测到 Cookie 但验证未通过（" + msg + "），未写入。可重新在浏览器登录后重试。",
+                        "is_error": True,
+                        "error": "CREDENTIAL_INVALID",
+                        "result": {"mode": "auto", "source": "browser_probe", **steam.credentials_status()},
+                    }
+                except ValueError as exc:
+                    return {
+                        "output": "检测到 Cookie 但写入失败：" + str(exc),
+                        "is_error": True,
+                        "error": "CREDENTIAL_INVALID",
+                        "result": {"mode": "auto", **steam.credentials_status()},
+                    }
+            # 探测不到：打开官方获取页 + 指引
             try:
                 webbrowser.open("https://steamcommunity.com/dev/apikey")
                 opened = "已为你打开 Steam API Key 获取页（https://steamcommunity.com/dev/apikey）。\n"
             except OSError:
                 opened = "请打开 https://steamcommunity.com/dev/apikey 获取 API Key。\n"
+            probe_note = f"浏览器 Cookie 自动探测未找到登录态（{probe.get('error') or '浏览器库中无 steamcommunity cookie'}）。\n" if not probe["found"] else ""
             return {
                 "output": (
                     opened
+                    + probe_note
                     + "步骤：1) 在页面登录你的 Steam 账号，域名填 localhost 即可点创建；"
                     "2) 把生成的 Key 复制给我（说'配置 Steam，Key 是……'），我会写入并验证；"
-                    "3) 回复好友还需 steamcommunity 登录 Cookie（含 sessionid），可按需一并提供。"
+                    "3) 回复好友还需 steamcommunity 登录态：登录 steamcommunity.com 后重新调用本工具（auto 会再次自动探测 Cookie）。"
                     + _cred_status_line(status)
                 ),
                 "is_error": False,

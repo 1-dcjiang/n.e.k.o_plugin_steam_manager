@@ -391,3 +391,63 @@ def test_credentials_status() -> None:
     assert set(status) == {"api_key_configured", "cookie_configured", "can_use_friends", "can_reply_friend"}
     assert status["can_use_friends"] == status["api_key_configured"]
     assert status["can_reply_friend"] == (status["api_key_configured"] and status["cookie_configured"])
+
+# ══════════ v0.3.2：浏览器 Cookie 自动探测 ══════════
+
+
+def test_decrypt_cookie_value_v10_ok(monkeypatch) -> None:
+    """v10 加密值可被 AES-GCM 解密；非 v10 原样返回。"""
+    import os
+    import sys
+
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from plugin.plugins.steam_manager import steam
+
+    aes_key = os.urandom(32)
+    nonce = os.urandom(12)
+    ct = AESGCM(aes_key).encrypt(nonce, b"sessionvalue123", None)
+    encrypted = b"v10" + nonce + ct
+    assert steam._decrypt_cookie_value(encrypted, aes_key) == "sessionvalue123"
+    assert steam._decrypt_cookie_value(b"plain-text", aes_key) == "plain-text"
+
+
+def test_probe_browser_cookies_no_browser_db(monkeypatch, tmp_path) -> None:
+    """无浏览器 Cookie 库时返回 found=False 且不抛错。"""
+    from plugin.plugins.steam_manager import steam
+
+    monkeypatch.setattr(steam, "_iter_browser_cookie_dbs", lambda: [])
+    result = steam.probe_browser_cookies()
+    assert result["found"] is False
+    assert result["sessionid"] == ""
+
+
+def test_probe_browser_cookies_finds_session(monkeypatch, tmp_path) -> None:
+    """探测到 sessionid 时正确返回（不依赖真实浏览器）。"""
+    from plugin.plugins.steam_manager import steam
+
+    rows = [("sessionid", "", b"v10"), ("steamLoginSecure", "", b"v10")]
+    monkeypatch.setattr(steam, "_iter_browser_cookie_dbs", lambda: [("fake.db", "fake.json")])
+
+    import os
+    import sqlite3
+
+    db = os.path.join(str(tmp_path), "cookies.db")
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT)")
+    for n, v, e in rows:
+        con.execute("INSERT INTO cookies VALUES (?,?,?,?)", (n, v, e, "steamcommunity.com"))
+    con.commit()
+    con.close()
+
+    def _fake_copy(src, dst):
+        import shutil
+
+        shutil.copyfile(db, dst)
+
+    monkeypatch.setattr(steam, "_copy_cookie_db", _fake_copy)
+    monkeypatch.setattr(steam, "_decrypt_cookie_value", lambda enc, key: b"decoded-value".decode() if enc == b"v10" else "")
+    monkeypatch.setattr(steam, "_chrome_aes_key", lambda path: b"k" * 32)
+    result = steam.probe_browser_cookies()
+    assert result["sessionid"] == "decoded-value"

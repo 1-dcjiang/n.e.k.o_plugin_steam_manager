@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -384,6 +385,137 @@ def credentials_status() -> dict:
         "can_use_friends": bool(key),
         "can_reply_friend": bool(key and cookie),
     }
+
+
+# ══════════ 浏览器 Cookie 自动探测（v0.3.2：解密 Chrome/Edge 本地库） ══════════
+# 仅读取本机自己浏览器的 steamcommunity 登录 cookie，用于配置插件，不输出任何明文到对话。
+
+def _dpapi_unprotect(data: bytes) -> bytes:
+    """用当前 Windows 用户 DPAPI 解密（CryptUnprotectData）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class _DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    blob_in = _DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+    ):
+        raise OSError("DPAPI 解密失败（CryptUnprotectData）")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def _chrome_aes_key(local_state_path: str) -> bytes:
+    """从 Local State 提取 AES-GCM 主密钥（DPAPI 解密 encrypted_key）。"""
+    import json
+
+    with open(local_state_path, "r", encoding="utf-8") as fh:
+        state = json.load(fh)
+    enc = state.get("os_crypt", {}).get("encrypted_key", "")
+    raw = base64.b64decode(enc)
+    if raw.startswith(b"DPAPI"):
+        return _dpapi_unprotect(raw[5:])
+    return raw  # v20：直接明文 AES key（少见）
+
+
+def _decrypt_cookie_value(encrypted_value: bytes, aes_key: bytes) -> str:
+    """解密 Chrome v10 cookie：3 字节 'v10' 前缀 + nonce(12) + AES-GCM 密文。"""
+    if encrypted_value.startswith(b"v10"):
+        nonce, ciphertext = encrypted_value[3:15], encrypted_value[15:]
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        return AESGCM(aes_key).decrypt(nonce, ciphertext, None).decode("utf-8", errors="replace")
+    return encrypted_value.decode("utf-8", errors="replace")
+
+
+def _copy_cookie_db(src: str, dst: str) -> None:
+    """复制 Cookie 库到临时文件（浏览器运行中 SQLite 可能被锁）。"""
+    import shutil
+
+    shutil.copyfile(src, dst)
+
+
+def _iter_browser_cookie_dbs() -> list[tuple[str, str]]:
+    """枚举 Chrome/Edge 各 profile 的 Cookies 数据库与 Local State，返回 [(db, local_state)]。"""
+    candidates: list[tuple[str, str]] = []
+    for app in ("Google\\Chrome", "Microsoft\\Edge"):
+        root = os.path.join(os.environ.get("LOCALAPPDATA", ""), app, "User Data")
+        if not os.path.isdir(root):
+            continue
+        local_state = os.path.join(root, "Local State")
+        if not os.path.isfile(local_state):
+            continue
+        for entry in os.scandir(root):
+            if not entry.is_dir():
+                continue
+            db = os.path.join(entry.path, "Network", "Cookies")
+            if os.path.isfile(db):
+                candidates.append((db, local_state))
+    return candidates
+
+
+def probe_browser_cookies() -> dict:
+    """自动探测本机浏览器里 steamcommunity.com 的登录 cookie。
+
+    返回 {"found": bool, "browser": str, "sessionid": str, "steam_login_secure": str,
+          "steam_login": str, "error": str}；值仅供插件写入使用，调用方不得回显。
+    """
+    import sqlite3
+    import tempfile
+
+    wanted = {"sessionid", "steamLoginSecure", "steamLogin", "steamCountry"}
+    found: dict[str, str] = {}
+    used_browser = ""
+    last_error = ""
+    for db_path, local_state in _iter_browser_cookie_dbs():
+        try:
+            aes_key = _chrome_aes_key(local_state)
+        except Exception as exc:  # noqa: BLE001 - 单个 profile 失败不中断
+            last_error = f"{os.path.basename(os.path.dirname(os.path.dirname(db_path)))} 密钥解密失败：{exc}"
+            continue
+        tmp = os.path.join(tempfile.gettempdir(), f"cookies_probe_{os.getpid()}_{len(found)}.db")
+        try:
+            try:
+                _copy_cookie_db(db_path, tmp)
+            except OSError as exc:
+                last_error = f"复制 Cookie 库失败：{exc}"
+                continue
+            con = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+            try:
+                rows = con.execute(
+                    "SELECT name, value, encrypted_value FROM cookies WHERE host_key LIKE '%steamcommunity.com%'"
+                ).fetchall()
+            finally:
+                con.close()
+            for name, value, enc in rows:
+                plain = value or _decrypt_cookie_value(enc, aes_key)
+                if name in wanted and name not in found:
+                    found[name] = plain
+            used_browser = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(db_path)))) or used_browser
+            if found.get("sessionid") and (found.get("steamLoginSecure") or found.get("steamLogin")):
+                break
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"读取 Cookie 库失败：{exc}"
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    result = {
+        "found": bool(found.get("sessionid") and (found.get("steamLoginSecure") or found.get("steamLogin"))),
+        "browser": used_browser,
+        "sessionid": found.get("sessionid", ""),
+        "steam_login_secure": found.get("steamLoginSecure", ""),
+        "steam_login": found.get("steamLogin", ""),
+        "steam_country": found.get("steamCountry", ""),
+        "error": last_error if not found.get("sessionid") else "",
+    }
+    return result
 
 
 # ══════════ 本地账号（config/loginusers.vdf） ══════════
