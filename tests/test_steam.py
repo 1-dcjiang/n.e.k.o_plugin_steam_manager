@@ -238,9 +238,13 @@ def test_open_app_installed_no_steam() -> None:
     assert result["error"] == "STEAM_NOT_FOUND"
 
 
-def test_open_app_not_installed_opens_store() -> None:
-    from plugin.plugins.steam_manager.steam import open_app
+def test_open_app_not_installed_opens_store(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import steam
 
-    result = open_app(None, "730", False)
+    opened: list[str] = []
+    monkeypatch.setattr(steam, "webbrowser", type("W", (), {"open": staticmethod(lambda u: opened.append(u))})())
+    result = steam.open_app(None, "730", False)
     assert result["ok"] is True
     assert "商店页" in result["output"]
+    assert len(opened) == 1
+    assert "steam://openurl/https://store.steampowered.com/app/730" in opened[0]

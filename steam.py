@@ -24,6 +24,7 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -357,7 +358,11 @@ def account_info(api_key: str, steam_id: str) -> dict | None:
     if not players:
         return None
     p = players[0]
-    state = int(p.get("personastate", 0) or 0)
+    state = 0
+    try:
+        state = int(p.get("personastate", 0) or 0)
+    except (TypeError, ValueError):
+        state = 0
     return {
         "steam_id": str(p.get("steamid") or steam_id),
         "name": str(p.get("personaname") or ""),
@@ -403,7 +408,11 @@ def friend_list(api_key: str, steam_id: str, limit: int = 200) -> list[dict]:
         if not sid:
             continue
         p = info_map.get(sid) or {}
-        state = int(p.get("personastate", 0) or 0)
+        state = 0
+        try:
+            state = int(p.get("personastate", 0) or 0)
+        except (TypeError, ValueError):
+            state = 0
         out.append(
             {
                 "steam_id": sid,
@@ -463,7 +472,7 @@ def send_friend_message(cookie: str, my_steam_id: str, friend_steam_id: str, tex
     if stripped.startswith("["):
         try:
             arr = json.loads(stripped)
-            if arr and str(arr[0]) in ("1", "1"):
+            if arr and str(arr[0]) == "1":  # 官方成功返回 [1, ...]
                 return {"ok": True, "to": friend_steam_id, "text": text}
         except ValueError:
             pass
@@ -590,12 +599,9 @@ def open_app(steam_path: str | None, app_id: str, installed: bool) -> dict:
             return {"ok": False, "error": "STEAM_NOT_FOUND", "output": "未检测到 Steam 安装目录，无法启动。"}
         return launch_game(steam_path, app_id)
     try:
-        urllib.request.urlopen(
-            f"steam://openurl/https://store.steampowered.com/app/{app_id}",
-            timeout=3.0,
-        )
-    except (OSError, urllib.error.URLError):
-        pass  # steam:// 协议由系统接管，请求失败不代表未打开
+        webbrowser.open(f"steam://openurl/https://store.steampowered.com/app/{app_id}")
+    except OSError as exc:
+        return {"ok": False, "error": "OPEN_FAILED", "output": f"打开商店页失败：{exc}"}
     return {
         "ok": True,
         "output": f"游戏（AppID {app_id}）未安装，已打开 Steam 商店页；在页面点击「安装」即可下载后游玩。",
