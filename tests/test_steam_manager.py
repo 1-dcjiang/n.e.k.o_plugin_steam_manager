@@ -103,3 +103,67 @@ def test_parse_vk() -> None:
     assert _parse_vk("27") == 27  # ESC
     assert _parse_vk("") is None
     assert _parse_vk("abc") is None
+
+# ══════════ v0.3.2：凭证自动配置（工具层） ══════════
+
+
+def test_credentials_skip_mode() -> None:
+    """skip：不配置，返回状态说明且不写文件。"""
+    from plugin.plugins.steam_manager import steam
+
+    orig_api = steam.api_key
+    orig_cookie = steam.community_cookie
+    steam.api_key = lambda: ""
+    steam.community_cookie = lambda: ""
+    try:
+        inst = _plugin()
+        result = _run(inst.steam_credentials(mode="skip", parameters={}))
+        assert result["is_error"] is False
+        assert "不配置" in result["output"]
+        assert result["result"]["mode"] == "skip"
+    finally:
+        steam.api_key = orig_api
+        steam.community_cookie = orig_cookie
+
+
+def test_credentials_yui_writes_and_verifies(monkeypatch, tmp_path) -> None:
+    """yui：提供 API Key → 写入插件目录并验证；验证失败如实报错。"""
+    from plugin.plugins.steam_manager import steam
+
+    written: list[str] = []
+    monkeypatch.setattr(steam, "save_api_key", lambda key, path=None: written.append(key) or str(tmp_path / "k.txt"))
+    monkeypatch.setattr(steam, "validate_api_key", lambda key: (False, "InvalidKey，请检查是否复制完整"))
+    monkeypatch.setattr(steam, "credentials_status", lambda: {"api_key_configured": True, "cookie_configured": False, "can_use_friends": True, "can_reply_friend": False})
+    inst = _plugin()
+    result = _run(inst.steam_credentials(mode="yui", api_key="BADKEY", parameters={}))
+    assert result["is_error"] is True
+    assert result["error"] == "CREDENTIAL_INVALID"
+    assert "验证未通过" in result["output"]
+    assert written == ["BADKEY"]
+
+
+def test_credentials_auto_without_credential_opens_guide(monkeypatch) -> None:
+    """auto 且无凭证：打开官方获取页并给指引，不报错。"""
+    import plugin.plugins.steam_manager as pkg
+    from plugin.plugins.steam_manager import steam
+
+    opened: list[str] = []
+    monkeypatch.setattr(pkg, "webbrowser", type("W", (), {"open": staticmethod(lambda u: opened.append(u))})())
+    monkeypatch.setattr(steam, "credentials_status", lambda: {"api_key_configured": False, "cookie_configured": False, "can_use_friends": False, "can_reply_friend": False})
+    inst = _plugin()
+    result = _run(inst.steam_credentials(mode="auto", parameters={}))
+    assert result["is_error"] is False
+    assert len(opened) == 1
+    assert "steamcommunity.com/dev/apikey" in opened[0]
+    assert "API Key" in result["output"]
+
+
+def test_entry_run_setup_routes(monkeypatch) -> None:
+    """入口 action=setup 路由到 steam_credentials。"""
+    from plugin.plugins.steam_manager import steam
+
+    monkeypatch.setattr(steam, "credentials_status", lambda: {"api_key_configured": False, "cookie_configured": False, "can_use_friends": False, "can_reply_friend": False})
+    inst = _plugin()
+    result = _run(inst.entry_run(action="setup", mode="skip", parameters={}))
+    assert result["is_error"] is False
+    assert "不配置" in result["output"]

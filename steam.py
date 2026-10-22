@@ -285,6 +285,107 @@ def _cookie_value(cookie_text: str, name: str) -> str:
     return ""
 
 
+# ══════════ 凭证自动配置（v0.3.2：skip / yui / auto 三模式 + 验证） ══════════
+
+
+def _credential_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def save_api_key(key: str, path: str | None = None) -> str:
+    """把 Steam Web API Key 写入插件目录 steam_api_key.txt，返回写入路径。"""
+    key = (key or "").strip()
+    if not key:
+        raise ValueError("API Key 为空")
+    target = path or os.path.join(_credential_dir(), "steam_api_key.txt")
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write(key)
+    return target
+
+
+def save_community_cookie(cookie: str, path: str | None = None) -> str:
+    """把 steamcommunity 登录 Cookie 写入插件目录 steam_cookie.txt，返回写入路径。"""
+    cookie = (cookie or "").strip()
+    if not cookie:
+        raise ValueError("Cookie 为空")
+    target = path or os.path.join(_credential_dir(), "steam_cookie.txt")
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write(cookie)
+    return target
+
+
+def validate_api_key(key: str) -> tuple[bool, str]:
+    """验证 API Key：用 Valve 官方账号 steamid 调 GetPlayerSummaries 探测。
+
+    返回 (是否有效, 说明)。Steam Web API 对无效 Key 通常返回 HTTP 403
+    （实测非 code=101），一律归类为"Key 无效"。
+    """
+    key = (key or "").strip()
+    if not key:
+        return False, "Key 为空"
+    try:
+        data = _http_get_json(
+            "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+            f"?key={urllib.parse.quote(key)}&steamids=76561197960287930"
+        )
+    except OSError as exc:
+        if "HTTP 403" in str(exc):
+            return False, "Key 无效（接口返回 403，通常为 Key 错误或被禁用），请检查是否复制完整"
+        return False, f"验证请求失败：{exc}"
+    except ValueError as exc:
+        return False, f"验证请求失败：{exc}"
+    code = data.get("code")
+    players = ((data.get("response") or {}).get("players"))
+    if code == 1 and players:
+        return True, "Key 有效（已通过官方接口验证）"
+    if code == 101:
+        return False, "Key 无效（InvalidKey），请检查是否复制完整"
+    return False, f"Key 无效（code={code}）"
+
+
+def _probe_cookie_page(cookie: str) -> tuple[str, str]:
+    """带 Cookie 请求 steamcommunity /profiles/me，返回 (最终URL, 页面文本)。"""
+    req = urllib.request.Request(
+        "https://steamcommunity.com/profiles/me",
+        headers={"User-Agent": _UA, "Cookie": cookie},
+    )
+    with urllib.request.urlopen(req, timeout=15.0) as resp:
+        return resp.geturl(), resp.read(65536).decode("utf-8", errors="replace")
+
+
+def validate_community_cookie(cookie: str) -> tuple[bool, str]:
+    """验证 steamcommunity Cookie：跳转到个人资料页或页面含身份信息 = 有效。
+
+    需含 sessionid（发消息必需）。返回 (是否有效, 说明)。
+    """
+    cookie = (cookie or "").strip()
+    if not cookie:
+        return False, "Cookie 为空"
+    if not _cookie_value(cookie, "sessionid"):
+        return False, "Cookie 缺少 sessionid（发消息必需，请重新登录后复制完整 Cookie）"
+    try:
+        final_url, body = _probe_cookie_page(cookie)
+    except urllib.error.HTTPError as exc:
+        return False, f"验证请求失败（HTTP {exc.code}）"
+    except OSError as exc:
+        return False, f"验证请求失败：{exc}"
+    if "/profiles/" in final_url or "personaName" in body or '"steamid"' in body:
+        return True, "Cookie 有效（已通过 steamcommunity 登录态验证）"
+    return False, "Cookie 无效或已过期（未登录到个人资料页）"
+
+
+def credentials_status() -> dict:
+    """返回当前凭证配置状态（只判断已配置与否，不输出内容）。"""
+    key = api_key()
+    cookie = community_cookie()
+    return {
+        "api_key_configured": bool(key),
+        "cookie_configured": bool(cookie),
+        "can_use_friends": bool(key),
+        "can_reply_friend": bool(key and cookie),
+    }
+
+
 # ══════════ 本地账号（config/loginusers.vdf） ══════════
 
 

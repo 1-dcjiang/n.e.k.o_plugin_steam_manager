@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import webbrowser
+
 from plugin.sdk.plugin import (
     NekoPluginBase,
     lifecycle,
@@ -426,6 +428,101 @@ class SteamManagerPlugin(NekoPluginBase):
             return {"output": result.get("output", "打开失败。"), "is_error": True, "error": result.get("error", "OPEN_FAILED")}
         return {"output": result.get("output", "已打开。"), "is_error": False}
 
+    # ══════════ 凭证自动配置（v0.3.2） ══════════
+
+    @llm_tool(
+        name="steam_credentials",
+        description=(
+            "配置 Steam 扩展能力所需凭证（STEAM_API_KEY 与 steam_cookie.txt）。何时用：用户问'配置 Steam/"
+            "给 Steam 配 API Key/好友功能用不了/回复好友用不了/自动配置一下'或插件提示缺少凭证时。"
+            "三种模式（mode）：skip=不配置（保留本地库/查价/促销能力，好友/发消息不可用）；"
+            "yui=拿到凭证由 YUI 配置：把 API Key 传 api_key、cookie 传 cookie 参数，写入插件目录并立即验证；"
+            "auto=全自动：有凭证同样写入验证，没有任何凭证时自动打开官方获取页并给出指引（仍需用户把 Key 复制回来，"
+            "验证这一步由助手协助）。验证通过才报告配置成功；验证失败必须如实说明原因，不得声称配置完成。"
+            "安全：Key/Cookie 只写入本地插件目录并验证有效性，不回显内容。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["skip", "yui", "auto"], "description": "skip=不配置 / yui=提供凭证由YUI配置 / auto=全自动"},
+                "api_key": {"type": "string", "description": "Steam Web API Key（yui/auto 时提供）"},
+                "cookie": {"type": "string", "description": "steamcommunity 登录 Cookie（yui/auto 时提供，需含 sessionid）"},
+            },
+        },
+        timeout=30.0,
+    )
+    async def steam_credentials(self, *, mode: str = "", api_key: str = "", cookie: str = "", **_):
+        params = _.get("parameters") or {}
+        mode = (mode or params.get("mode") or "auto").strip().lower()
+        api_key = (api_key or params.get("api_key") or "").strip()
+        cookie = (cookie or params.get("cookie") or "").strip()
+        status = steam.credentials_status()
+        if mode == "skip":
+            return {
+                "output": "已选择不配置 Steam 凭证。本地游戏库/启动游戏/查价格/看促销功能不受影响；"
+                "好友列表与回复好友功能保持不可用。随时可再次调用本工具配置。",
+                "is_error": False,
+                "result": {"mode": "skip", **status},
+            }
+        saved: list[str] = []
+        problems: list[str] = []
+        if api_key:
+            try:
+                steam.save_api_key(api_key)
+                ok, msg = steam.validate_api_key(api_key)
+                saved.append(f"API Key：{'已写入并验证通过' if ok else f'已写入但验证未通过（{msg}）'}")
+                if not ok:
+                    problems.append(msg)
+            except ValueError as exc:
+                problems.append(str(exc))
+        if cookie:
+            try:
+                steam.save_community_cookie(cookie)
+                ok, msg = steam.validate_community_cookie(cookie)
+                saved.append(f"Cookie：{'已写入并验证通过' if ok else f'已写入但验证未通过（{msg}）'}")
+                if not ok:
+                    problems.append(msg)
+            except ValueError as exc:
+                problems.append(str(exc))
+        if not api_key and not cookie:
+            if mode == "yui":
+                return {
+                    "output": "未收到凭证（mode=yui 需要你提供 api_key 或 cookie 参数）。可先调用 auto 模式打开获取页。",
+                    "is_error": True,
+                    "error": "NO_CREDENTIAL",
+                }
+            # auto 且无凭证：打开官方获取页 + 指引
+            try:
+                webbrowser.open("https://steamcommunity.com/dev/apikey")
+                opened = "已为你打开 Steam API Key 获取页（https://steamcommunity.com/dev/apikey）。\n"
+            except OSError:
+                opened = "请打开 https://steamcommunity.com/dev/apikey 获取 API Key。\n"
+            return {
+                "output": (
+                    opened
+                    + "步骤：1) 在页面登录你的 Steam 账号，域名填 localhost 即可点创建；"
+                    "2) 把生成的 Key 复制给我（说'配置 Steam，Key 是……'），我会写入并验证；"
+                    "3) 回复好友还需 steamcommunity 登录 Cookie（含 sessionid），可按需一并提供。"
+                    + _cred_status_line(status)
+                ),
+                "is_error": False,
+                "result": {"mode": "auto", **status},
+            }
+        new_status = steam.credentials_status()
+        summary = "\n".join(saved) if saved else "本次未写入任何凭证。"
+        if problems:
+            return {
+                "output": summary + "\n\n⚠ 以下验证未通过，请修正后重试：\n" + "\n".join(problems) + "\n" + _cred_status_line(new_status),
+                "is_error": True,
+                "error": "CREDENTIAL_INVALID",
+                "result": {"mode": mode, **new_status},
+            }
+        return {
+            "output": summary + "\n" + _cred_status_line(new_status),
+            "is_error": False,
+            "result": {"mode": mode, **new_status},
+        }
+
     # ══════════ 游戏助手工具 ══════════
 
     @llm_tool(
@@ -630,6 +727,7 @@ class SteamManagerPlugin(NekoPluginBase):
             "reply（给好友发消息，需 STEAM_API_KEY + steam_cookie.txt）/ "
             "price（查游戏价格，无需凭证）/ promo（查商店促销，无需凭证）/ "
             "open（打开任意游戏：已装启动、未装开商店页）/ "
+            "setup（凭证自动配置：skip 不配置 / yui 提供凭证写入 / auto 全自动打开获取页并指引）/ "
             "capture（截取当前游戏画面）/ watch（开启/关闭后台画面监控）/ summary（汇总局面与行为时间线）/ "
             "control（开启/交还键鼠接管，需用户显式授权且仅作用于前台游戏窗口）/ action（click/key/text 操作，需先授权）。"
             "安全边界：只读本地库元数据；键鼠接管默认关闭、必须用户明确授权，仅作用于当前前台游戏窗口；"
@@ -656,6 +754,9 @@ class SteamManagerPlugin(NekoPluginBase):
                 "click_y": {"type": "integer", "description": "action=click 的窗口相对 Y（0-1000）"},
                 "key": {"type": "string", "description": "action=key 的单字母或虚拟键码"},
                 "sub_action": {"type": "string", "description": "action=action 时的子操作：click / key / text（v0.3.1 修复入口可达性）"},
+                "mode": {"type": "string", "description": "action=setup 的凭证配置模式：skip / yui / auto"},
+                "api_key": {"type": "string", "description": "action=setup 时要写入并验证的 Steam Web API Key"},
+                "cookie": {"type": "string", "description": "action=setup 时要写入并验证的 steamcommunity Cookie"},
             },
         },
         timeout=30.0,
@@ -699,6 +800,13 @@ class SteamManagerPlugin(NekoPluginBase):
             return await self.steam_reply_friend(friend=friend, text=text, parameters={})
         if action in ("price", "pricing"):
             return await self.steam_game_price(game=game, parameters={})
+        if action in ("setup", "credentials", "config"):
+            return await self.steam_credentials(
+                mode=str(kwargs.get("mode") or params.get("mode") or "auto"),
+                api_key=str(kwargs.get("api_key") or params.get("api_key") or ""),
+                cookie=str(kwargs.get("cookie") or params.get("cookie") or ""),
+                parameters={},
+            )
         if action in ("promo", "promotions", "sale"):
             return await self.steam_promotions(limit=limit, parameters={})
         if action in ("open", "open_app"):
@@ -721,6 +829,15 @@ class SteamManagerPlugin(NekoPluginBase):
             "is_error": True,
             "error": "NO_ACTION",
         }
+
+
+def _cred_status_line(status: dict) -> str:
+    return (
+        f"当前配置状态：API Key{'已配置' if status['api_key_configured'] else '未配置'} | "
+        f"Cookie{'已配置' if status['cookie_configured'] else '未配置'} | "
+        f"好友功能：{'可用' if status['can_use_friends'] else '不可用'} | "
+        f"回复好友：{'可用' if status['can_reply_friend'] else '不可用'}"
+    )
 
 
 def _parse_vk(key: str) -> int | None:

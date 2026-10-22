@@ -301,3 +301,79 @@ def test_friend_list_batches_over_100(monkeypatch) -> None:
         import urllib.parse as up
         assert len(up.unquote(ids_part).split(",")) <= 100
     assert all(f["name"].startswith("P") for f in friends)
+
+# ══════════ v0.3.2：凭证自动配置（保存/验证） ══════════
+
+
+def test_save_api_key_and_cookie(tmp_path) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    key_path = steam.save_api_key("ABCDEF012345", path=str(tmp_path / "steam_api_key.txt"))
+    cookie_path = steam.save_community_cookie("sessionid=x; steamLoginSecure=y", path=str(tmp_path / "steam_cookie.txt"))
+    assert key_path.endswith("steam_api_key.txt")
+    assert cookie_path.endswith("steam_cookie.txt")
+    assert open(key_path, encoding="utf-8").read().strip() == "ABCDEF012345"
+    assert "sessionid=x" in open(cookie_path, encoding="utf-8").read()
+
+
+def test_save_api_key_empty_raises(tmp_path) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    try:
+        steam.save_api_key("  ", path=str(tmp_path / "k.txt"))
+        raise AssertionError("应当抛 ValueError")
+    except ValueError:
+        pass
+
+
+def test_validate_api_key_ok(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    monkeypatch.setattr(steam, "_http_get_json", lambda url: {"code": 1, "response": {"players": [{"steamid": "76561197960287930"}]}})
+    ok, msg = steam.validate_api_key("KEY123")
+    assert ok is True
+    assert "有效" in msg
+
+
+def test_validate_api_key_invalid(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    monkeypatch.setattr(steam, "_http_get_json", lambda url: {"code": 101, "response": None})
+    ok, msg = steam.validate_api_key("BAD")
+    assert ok is False
+    assert "InvalidKey" in msg
+
+
+def test_validate_community_cookie_ok(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    monkeypatch.setattr(steam, "_probe_cookie_page", lambda cookie: ("https://steamcommunity.com/profiles/76561198", '<div class="personaName">x</div>'))
+    ok, msg = steam.validate_community_cookie("sessionid=abc; steamLoginSecure=xyz")
+    assert ok is True
+    assert "有效" in msg
+
+
+def test_validate_community_cookie_missing_session(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    ok, msg = steam.validate_community_cookie("steamLoginSecure=xyz")
+    assert ok is False
+    assert "sessionid" in msg
+
+
+def test_validate_community_cookie_stale(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    monkeypatch.setattr(steam, "_probe_cookie_page", lambda cookie: ("https://steamcommunity.com/login", "<html>login</html>"))
+    ok, msg = steam.validate_community_cookie("sessionid=abc; steamLoginSecure=xyz")
+    assert ok is False
+    assert "无效或已过期" in msg
+
+
+def test_credentials_status() -> None:
+    from plugin.plugins.steam_manager import steam
+
+    status = steam.credentials_status()
+    assert set(status) == {"api_key_configured", "cookie_configured", "can_use_friends", "can_reply_friend"}
+    assert status["can_use_friends"] == status["api_key_configured"]
+    assert status["can_reply_friend"] == (status["api_key_configured"] and status["cookie_configured"])
