@@ -327,9 +327,10 @@ def test_save_api_key_empty_raises(tmp_path) -> None:
 
 
 def test_validate_api_key_ok(monkeypatch) -> None:
+    """成功响应无 code 字段（players 非空即有效）——实网确认成功响应结构。"""
     from plugin.plugins.steam_manager import steam
 
-    monkeypatch.setattr(steam, "_http_get_json", lambda url: {"code": 1, "response": {"players": [{"steamid": "76561197960287930"}]}})
+    monkeypatch.setattr(steam, "_http_get_json", lambda url: {"response": {"players": [{"steamid": "76561197960287930"}]}})
     ok, msg = steam.validate_api_key("KEY123")
     assert ok is True
     assert "有效" in msg
@@ -342,6 +343,19 @@ def test_validate_api_key_invalid(monkeypatch) -> None:
     ok, msg = steam.validate_api_key("BAD")
     assert ok is False
     assert "InvalidKey" in msg
+
+
+def test_validate_api_key_forbidden(monkeypatch) -> None:
+    """无效 Key 实测返回 HTTP 403（而非 code=101），归类为无效。"""
+    from plugin.plugins.steam_manager import steam
+
+    def _raise(_url):
+        raise OSError("HTTP Error 403: Forbidden")
+
+    monkeypatch.setattr(steam, "_http_get_json", _raise)
+    ok, msg = steam.validate_api_key("BAD")
+    assert ok is False
+    assert "403" in msg
 
 
 def test_validate_community_cookie_ok(monkeypatch) -> None:

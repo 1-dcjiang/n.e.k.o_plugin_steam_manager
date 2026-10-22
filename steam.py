@@ -317,8 +317,9 @@ def save_community_cookie(cookie: str, path: str | None = None) -> str:
 def validate_api_key(key: str) -> tuple[bool, str]:
     """验证 API Key：用 Valve 官方账号 steamid 调 GetPlayerSummaries 探测。
 
-    返回 (是否有效, 说明)。Steam Web API 对无效 Key 通常返回 HTTP 403
-    （实测非 code=101），一律归类为"Key 无效"。
+    返回 (是否有效, 说明)。成功响应无 code 字段（players 非空即有效）；
+    Steam Web API 对无效 Key 通常返回 HTTP 403（实测非 code=101），
+    一律归类为"Key 无效"。
     """
     key = (key or "").strip()
     if not key:
@@ -334,13 +335,12 @@ def validate_api_key(key: str) -> tuple[bool, str]:
         return False, f"验证请求失败：{exc}"
     except ValueError as exc:
         return False, f"验证请求失败：{exc}"
-    code = data.get("code")
     players = ((data.get("response") or {}).get("players"))
-    if code == 1 and players:
+    if players:
         return True, "Key 有效（已通过官方接口验证）"
-    if code == 101:
+    if data.get("code") == 101:
         return False, "Key 无效（InvalidKey），请检查是否复制完整"
-    return False, f"Key 无效（code={code}）"
+    return False, f"Key 无效（code={data.get('code')}）"
 
 
 def _probe_cookie_page(cookie: str) -> tuple[str, str]:
