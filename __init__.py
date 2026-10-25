@@ -622,14 +622,20 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def game_capture(self, **_):
+        import logging
+
+        _log = logging.getLogger("N.E.K.O.Plugin_steam_manager")
         info = control.get_foreground_window_info()
+        civ = control.find_civ6_window()
+        _log.info("game_capture: fg=%r civ6_window=%r",
+                  info and info.get("title"), civ and civ.get("title"))
         # 增强（v0.3.4）：前台窗口不是文明6 但文明6 窗口存在时，改用 PrintWindow
         # 直抓游戏窗口本体——前台被聊天/终端窗口遮挡时，屏幕区域截图只会截到遮挡层，
         # PrintWindow 向游戏窗口请求绘制，拿到的永远是游戏画面。
-        civ = control.find_civ6_window()
         fg_is_civ = info is not None and "civilization vi" in (info.get("title") or "").casefold()
         if civ is not None and not fg_is_civ:
             path = control.capture_window_printwindow(civ)
+            _log.info("game_capture: printwindow=%s", bool(path))
             if path:
                 self._state.note_frame(civ, path)
                 self._state.note_event("capture", f"{civ['title']} / {civ['process']} (printwindow)")
@@ -647,6 +653,19 @@ class SteamManagerPlugin(NekoPluginBase):
                     "screenshot": view_path,
                     "images": _image_entry(view_path) or [],
                 }
+            # PrintWindow 直抓失败（运行环境限制）：如实说明并引导改用 civ6_buddy 的 peek
+            return {
+                "output": (
+                    f"检测到文明6 窗口存在（{civ['title']}）但 PrintWindow 直抓失败"
+                    f"（进程环境限制，前台被遮挡时本工具截不到游戏本体）。\n"
+                    f"请改用 civ6_buddy 插件的 civ6_ops_peek 工具确认文明6 画面——"
+                    f"它会用同一条 PrintWindow 通道直抓游戏本体（被遮挡也能拿到），"
+                    f"或让玩家把游戏切到前台后我再截一次。"
+                ),
+                "is_error": True,
+                "error": "PRINTWINDOW_FAIL",
+            }
+        _log.info("game_capture: branch=bitblt fg=%r", info and info.get("title"))
         if not info:
             return {"output": "没有检测到前台窗口（可能窗口已最小化）。请确认游戏窗口在前台。", "is_error": True, "error": "NO_WINDOW"}
         path = control.capture_window_bmp(info)
