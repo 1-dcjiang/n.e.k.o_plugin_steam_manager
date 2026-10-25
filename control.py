@@ -193,6 +193,102 @@ def _write_bmp(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str
     return path
 
 
+def find_civ6_window() -> dict | None:
+    """查找文明6 主窗口（标题含 'Civilization VI'），返回与 get_foreground_window_info 同构的信息。
+
+    用于 PrintWindow 直抓游戏画面：游戏被聊天/终端窗口遮挡时，前台窗口截图只能
+    截到遮挡层，而 PrintWindow 直接向文明6 窗口请求绘制，拿到的永远是游戏本体。"""
+    if USER32 is None:
+        return None
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    def _enum(hwnd, _lparam):
+        if USER32.IsWindowVisible(hwnd):
+            title_buf = ctypes.create_unicode_buffer(512)
+            USER32.GetWindowTextW(hwnd, title_buf, 512)
+            title = title_buf.value or ""
+            if "civilization vi" in title.casefold():
+                found.append(hwnd)
+                return False
+        return True
+
+    USER32.EnumWindows(_enum, 0)
+    if not found:
+        return None
+    hwnd = found[0]
+    rect = _Rect()
+    USER32.GetWindowRect(hwnd, ctypes.byref(rect))
+    style = USER32.GetWindowLongW(hwnd, _GWL_STYLE)
+    if style & _WS_MINIMIZE:
+        return None  # 最小化窗口 PrintWindow 拿不到有效画面
+    title_buf = ctypes.create_unicode_buffer(512)
+    USER32.GetWindowTextW(hwnd, title_buf, 512)
+    pid = wt.DWORD()
+    USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return {
+        "hwnd": hwnd,
+        "title": title_buf.value or "",
+        "pid": pid.value,
+        "process": _process_name(pid.value),
+        "rect": (rect.left, rect.top, rect.right, rect.bottom),
+        "ts": time.time(),
+    }
+
+
+def capture_window_printwindow(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
+    """PrintWindow 直抓窗口内容，保存为 BMP，返回文件路径；失败返回 None。
+
+    与 capture_window_bmp（屏幕区域截图，被遮挡时截到最上层窗口）的区别：
+    PrintWindow 向目标窗口请求绘制，拿到的永远是窗口本体画面——
+    游戏被聊天/终端窗口完全遮挡时也能拿到游戏画面。"""
+    if USER32 is None or GDI32 is None:
+        return None
+    hwnd = info.get("hwnd")
+    if not hwnd:
+        return None
+    left, top, right, bottom = info["rect"]
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    hdc_win = USER32.GetWindowDC(hwnd)
+    if not hdc_win:
+        return None
+    try:
+        hdc_mem = GDI32.CreateCompatibleDC(hdc_win)
+        if not hdc_mem:
+            return None
+        try:
+            hbmp = GDI32.CreateCompatibleBitmap(hdc_win, width, height)
+            if not hbmp:
+                return None
+            try:
+                old = GDI32.SelectObject(hdc_mem, hbmp)
+                PW_RENDERFULLCONTENT = 2
+                if not USER32.PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT):
+                    GDI32.SelectObject(hdc_mem, old)
+                    return None
+                bmi = _BitmapInfo()
+                bmi.bmiHeader.biSize = ctypes.sizeof(_BitmapInfoHeader)
+                bmi.bmiHeader.biWidth = width
+                bmi.bmiHeader.biHeight = -height
+                bmi.bmiHeader.biPlanes = 1
+                bmi.bmiHeader.biBitCount = 32
+                bmi.bmiHeader.biCompression = _BI_RGB
+                row_size = (width * 4 + 3) & ~3
+                buf = ctypes.create_string_buffer(row_size * height)
+                if not GDI32.GetDIBits(hdc_mem, hbmp, 0, height, buf, ctypes.byref(bmi), 0):
+                    GDI32.SelectObject(hdc_mem, old)
+                    return None
+                GDI32.SelectObject(hdc_mem, old)
+                return _write_bmp(save_dir, width, height, buf.raw)
+            finally:
+                GDI32.DeleteObject(hbmp)
+        finally:
+            GDI32.DeleteDC(hdc_mem)
+    finally:
+        USER32.ReleaseDC(hwnd, hdc_win)
+
+
 # ══════════ 键鼠模拟 ══════════
 
 

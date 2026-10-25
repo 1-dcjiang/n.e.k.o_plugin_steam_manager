@@ -573,6 +573,27 @@ class SteamManagerPlugin(NekoPluginBase):
     )
     async def game_capture(self, **_):
         info = control.get_foreground_window_info()
+        # 增强（v0.3.4）：前台窗口不是文明6 但文明6 窗口存在时，改用 PrintWindow
+        # 直抓游戏窗口本体——前台被聊天/终端窗口遮挡时，屏幕区域截图只会截到遮挡层，
+        # PrintWindow 向游戏窗口请求绘制，拿到的永远是游戏画面。
+        civ = control.find_civ6_window()
+        fg_is_civ = info is not None and "civilization vi" in (info.get("title") or "").casefold()
+        if civ is not None and not fg_is_civ:
+            path = control.capture_window_printwindow(civ)
+            if path:
+                self._state.note_frame(civ, path)
+                self._state.note_event("capture", f"{civ['title']} / {civ['process']} (printwindow)")
+                width = civ["rect"][2] - civ["rect"][0]
+                height = civ["rect"][3] - civ["rect"][1]
+                return {
+                    "output": (
+                        f"已截取文明6 游戏窗口画面（PrintWindow 直抓，被聊天/终端窗口遮挡也能拿到游戏本体）：\n"
+                        f"窗口：{civ['title']}（进程 {civ['process']}，PID {civ['pid']}）\n"
+                        f"尺寸：{width}×{height}\n截图路径：{path}\n时间：{civ['ts']:.0f}"
+                    ),
+                    "is_error": False,
+                    "screenshot": path,
+                }
         if not info:
             return {"output": "没有检测到前台窗口（可能窗口已最小化）。请确认游戏窗口在前台。", "is_error": True, "error": "NO_WINDOW"}
         path = control.capture_window_bmp(info)
