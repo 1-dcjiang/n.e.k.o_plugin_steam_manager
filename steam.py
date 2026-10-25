@@ -204,7 +204,7 @@ def find_game(steam_path: str, query: str, limit: int = 100) -> list[dict]:
     v0.3.1：修复 limit 截断顺序——此前先截断后过滤，游戏库超 limit 时
     关键词匹配项可能被截掉导致误报"未找到"。
     """
-    query = (query or "").strip().lower()
+    query = _alias_expand(query)
     games = scan_games(steam_path, limit=0)
     if query:
         if query.isdigit():
@@ -215,6 +215,49 @@ def find_game(steam_path: str, query: str, limit: int = 100) -> list[dict]:
 
 
 # ══════════ 启动游戏 ══════════
+
+
+# 常见游戏中文别名/简写 → 英文名匹配关键词（中文玩家习惯用中文名搜）。
+# 命中后按英文关键词做子串匹配，避免"文明6"搜不到 Civilization VI 这类误报"未安装"。
+_GAME_ALIASES = {
+    "文明": "civilization",
+    "文明6": "civilization vi",
+    "文明六": "civilization vi",
+    "文明vi": "civilization vi",
+    "civ6": "civilization vi",
+    "civ": "civilization",
+    "席德梅尔的文明": "civilization",
+    "钢铁雄心": "hearts of iron",
+    "钢4": "hearts of iron",
+    "hoi4": "hearts of iron",
+    "群星": "stellaris",
+    "欧陆风云": "europa universalis",
+    "维多利亚": "victoria",
+    "十字军之王": "crusader kings",
+    "ck3": "crusader kings",
+    "gmod": "garry",
+    "盖瑞模组": "garry",
+    "garrys mod": "garry",
+    "骑砍": "mount & blade",
+    "文明6开发": "development assets",
+}
+
+# 常见游戏 AppID → 中文显示名（list_games 输出附加，方便 LLM 识别"文明6"就是 Civilization VI）。
+_GAME_CN_NAMES = {
+    "289070": "文明6",
+    "597260": "文明6开发工具(SDK)",
+    "394360": "钢铁雄心4",
+    "4000": "Garry's Mod",
+    "945360": "VRChat",
+}
+
+
+def _alias_expand(query: str) -> str:
+    """把中文别名/简写展开成英文匹配关键词；无别名时原样返回（小写）。"""
+    q = (query or "").strip().lower()
+    if q in _GAME_ALIASES and _GAME_ALIASES[q]:
+        return _GAME_ALIASES[q]
+    return q
 
 
 def launch_game(steam_path: str, app_id: str) -> dict:

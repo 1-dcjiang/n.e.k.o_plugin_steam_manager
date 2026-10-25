@@ -148,7 +148,12 @@ class SteamManagerPlugin(NekoPluginBase):
         if not installed:
             return {"output": f"未找到匹配的已安装游戏（关键词：{keyword or '全部'}）。", "is_error": True, "error": "NO_MATCH"}
         shown = installed[:limit]
-        lines = [f"{g['name']}（AppID {g['app_id']}，{g['size_mb']} MB，{g['state']}）" for g in shown]
+        lines = [
+            f"{g['name']}（AppID {g['app_id']}，{g['size_mb']} MB，{g['state']}"
+            + (f"，中文名：{steam._GAME_CN_NAMES.get(g['app_id'], '')}" if steam._GAME_CN_NAMES.get(g['app_id']) else "")
+            + "）"
+            for g in shown
+        ]
         head = f"共找到 {len(installed)} 个已安装游戏，显示前 {len(shown)} 个："
         return {"output": head + "\n" + "\n".join(lines), "is_error": False, "games": shown}
 
