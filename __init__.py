@@ -38,6 +38,39 @@ def _to_png(bmp_path: str) -> str:
         return bmp_path
 
 
+def _image_entry(image_path: str) -> list | None:
+    """把截图文件读成 N.E.K.O ``images`` 通道条目 [{data_b64, mime}]。
+
+    关键：N.E.K.O 只会把工具返回 dict 的 ``images`` 数组喂给模型视觉——
+    ``screenshot`` 字段只是文本路径，YUI 永远收不到图（此前'看不到画面'的真正根因）。
+    超 2MB base64 上限时用 PIL 缩图存 JPEG（N.E.K.O 交付侧还会再压缩到 ≤500KB）。
+    """
+    if not image_path:
+        return None
+    try:
+        import base64
+
+        with open(image_path, "rb") as fh:
+            raw = fh.read()
+        b64 = base64.b64encode(raw).decode("ascii")
+        if len(b64) <= 2 * 1024 * 1024:
+            return [{"data_b64": b64, "mime": "image/png"}]
+        from io import BytesIO
+
+        from PIL import Image
+
+        im = Image.open(image_path).convert("RGB")
+        w, h = im.size
+        scale = min(1.0, 1200.0 / max(w, h))
+        if scale < 1.0:
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        buf = BytesIO()
+        im.save(buf, "JPEG", quality=82)
+        return [{"data_b64": base64.b64encode(buf.getvalue()).decode("ascii"), "mime": "image/jpeg"}]
+    except Exception:
+        return None
+
+
 @neko_plugin
 class SteamManagerPlugin(NekoPluginBase):
     """N.E.K.O. 插件：Steam 游戏库管理与游戏助手。"""
@@ -612,6 +645,7 @@ class SteamManagerPlugin(NekoPluginBase):
                     ),
                     "is_error": False,
                     "screenshot": view_path,
+                    "images": _image_entry(view_path) or [],
                 }
         if not info:
             return {"output": "没有检测到前台窗口（可能窗口已最小化）。请确认游戏窗口在前台。", "is_error": True, "error": "NO_WINDOW"}
@@ -631,6 +665,7 @@ class SteamManagerPlugin(NekoPluginBase):
             ),
             "is_error": False,
             "screenshot": view_path,
+            "images": _image_entry(view_path) or [],
         }
 
     @llm_tool(
