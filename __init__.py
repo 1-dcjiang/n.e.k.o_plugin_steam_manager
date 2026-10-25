@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 import webbrowser
 
 from plugin.sdk.plugin import (
@@ -81,6 +83,31 @@ class SteamManagerPlugin(NekoPluginBase):
         self._state = control.ControlState()
         self._watcher = control.FrameWatcher(self._state)
 
+    # ══════════ 跨插件优先级：civ6 运营锁让位 ══════════
+    # civ6_buddy 运营托管期间写 `%LOCALAPPDATA%\N.E.K.O\config\civ6_ops_active`（带时间戳），
+    # 见新鲜锁（<5 分钟）即让位：本插件所有操作拒绝执行，避免抢占 YUI 运营注意力。
+    _CIV6_OPS_LOCK_TTL = 300.0
+
+    def _civ6_ops_yield(self) -> dict | None:
+        p = os.path.join(os.environ.get("LOCALAPPDATA", ""), "N.E.K.O", "config", "civ6_ops_active")
+        if not p or not os.path.isfile(p):
+            return None
+        try:
+            fresh = (time.time() - os.path.getmtime(p)) < self._CIV6_OPS_LOCK_TTL
+        except OSError:
+            return None
+        if not fresh:
+            return None
+        return {
+            "output": (
+                "YUI 正在托管运营《文明6》（检测到 civ6_buddy 运营锁，Steam 管理已让位暂停）。"
+                "为避免抢占运营注意力，本轮不执行 Steam 操作；如确需操作，请先让 YUI "
+                "调用 civ6_ops_handoff 交还文明6 控制权后再来。"
+            ),
+            "is_error": True,
+            "error": "CIV6_OPS_ACTIVE_YIELD",
+        }
+
     # ══════════ 生命周期 ══════════
 
     @lifecycle(id="startup")
@@ -107,6 +134,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=15.0,
     )
     async def steam_status(self, **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         path = self._steam_path or steam.find_steam_path()
         if not path:
             return {"output": "未检测到 Steam 安装目录。请确认已安装 Steam 客户端（常见路径 C:\\Program Files (x86)\\Steam）。", "is_error": True, "error": "STEAM_NOT_FOUND"}
@@ -133,6 +163,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def list_games(self, *, keyword: str = "", limit: int = 0, **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         keyword = (keyword or params.get("keyword") or "").strip()
         try:
@@ -174,6 +207,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def launch_game(self, *, game: str = "", **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         game = (game or params.get("game") or "").strip()
         if not game:
@@ -221,6 +257,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=20.0,
     )
     async def steam_account(self, *, steam_id: str = "", **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         steam_id = (steam_id or params.get("steam_id") or "").strip()
         path = self._steam_path or steam.find_steam_path()
@@ -272,6 +311,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def steam_friends(self, *, steam_id: str = "", name_filter: str = "", **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         steam_id = (steam_id or params.get("steam_id") or "").strip()
         name_filter = (name_filter or params.get("name_filter") or "").strip()
@@ -313,6 +355,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def steam_reply_friend(self, *, friend: str = "", text: str = "", **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         friend = (friend or params.get("friend") or "").strip()
         text = (text or params.get("text") or "").strip()
@@ -362,6 +407,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def steam_game_price(self, *, game: str = "", **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         game = (game or params.get("game") or "").strip()
         if not game:
@@ -405,6 +453,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def steam_promotions(self, *, limit: int = 0, **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         try:
             limit = int(limit or params.get("limit") or 15)
@@ -441,6 +492,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def steam_open_app(self, *, game: str = "", **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         game = (game or params.get("game") or "").strip()
         if not game:
@@ -508,6 +562,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def steam_credentials(self, *, mode: str = "", api_key: str = "", cookie: str = "", **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         mode = (mode or params.get("mode") or "auto").strip().lower()
         api_key = (api_key or params.get("api_key") or "").strip()
@@ -627,6 +684,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=30.0,
     )
     async def game_capture(self, **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         import logging
 
         _log = logging.getLogger("N.E.K.O.Plugin_steam_manager")
@@ -709,6 +769,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=20.0,
     )
     async def watch_game(self, *, on: bool = False, interval: int = 0, **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         on = bool(params.get("on", on))
         try:
@@ -736,6 +799,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=20.0,
     )
     async def game_state_summary(self, **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         summary = self._state.summary()
         lines = []
         lines.append(f"监控状态：{'开启' if summary['watch_enabled'] else '关闭'} | 接管状态：{'YUI 已接管' if summary['control_enabled'] else '未接管'}")
@@ -775,6 +841,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=20.0,
     )
     async def take_control(self, *, on: bool = False, **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         on = bool(params.get("on", on))
         if not on:
@@ -810,6 +879,9 @@ class SteamManagerPlugin(NekoPluginBase):
         timeout=20.0,
     )
     async def game_action(self, *, action: str = "", x: int = 0, y: int = 0, key: str = "", text: str = "", **_):
+        _y = self._civ6_ops_yield()
+        if _y:
+            return _y
         params = _.get("parameters") or {}
         action = (action or params.get("action") or "").strip().lower()
         try:
