@@ -164,7 +164,26 @@ def capture_window_bmp(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
     GDI32.DeleteObject(hbmp)
     GDI32.DeleteDC(hdc_mem)
     USER32.ReleaseDC(None, hdc_screen)
-    return _write_bmp(save_dir, width, height, buf.raw)
+    return _write_png(save_dir, width, height, buf.raw)
+
+
+def _write_png(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str | None:
+    """把 BGRA DIB 像素直接存为 PNG（PIL，视觉模型可读）。
+
+    BMP 通道此前手写文件头，biSizeImage 用了 32bit 行对齐值而实际像素是 3 字节行，
+    长度不一致导致 BMP 损坏（PIL/YUI 视觉报 truncated，'看不到画面'的根因）。
+    PIL 写 PNG 由库保证头/数据一致。PIL 不可用时回退修正后的 _write_bmp。
+    """
+    try:
+        from PIL import Image
+
+        os.makedirs(save_dir, exist_ok=True)
+        img = Image.frombytes("RGBA", (width, height), dib_pixels, "raw", "BGRA").convert("RGB")
+        path = os.path.join(save_dir, f"frame_{int(time.time() * 1000)}.png")
+        img.save(path, "PNG")
+        return path
+    except Exception:
+        return _write_bmp(save_dir, width, height, dib_pixels)
 
 
 def _write_bmp(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str | None:
@@ -176,18 +195,11 @@ def _write_bmp(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str
     header += b"BM"
     header += struct.pack("<IHHI", file_size, 0, 0, 54)
     header += struct.pack("<IiiHHIIiiII", 40, width, height, 1, 32, 0, data_size, 0, 0, 0, 0)
-    # BGRA → BGR（去掉 alpha，每像素 3 字节）
-    pixels = bytearray()
-    for y in range(height):
-        row = dib_pixels[y * row_size:(y + 1) * row_size]
-        for x in range(width):
-            i = x * 4
-            pixels += row[i:i + 3]
-        pixels += b"\x00" * ((row_size - width * 3) % 4)
+    # 32bit BGRA：每像素 4 字节，行宽天然 4 字节对齐，DIB 数据直接落盘即可合法
     path = os.path.join(save_dir, f"frame_{int(time.time() * 1000)}.bmp")
     try:
         with open(path, "wb") as fh:
-            fh.write(bytes(header) + bytes(pixels))
+            fh.write(bytes(header) + dib_pixels[:data_size])
     except OSError:
         return None
     return path
@@ -280,7 +292,7 @@ def capture_window_printwindow(info: dict, save_dir: str = _FRAME_DIR) -> str | 
                     GDI32.SelectObject(hdc_mem, old)
                     return None
                 GDI32.SelectObject(hdc_mem, old)
-                return _write_bmp(save_dir, width, height, buf.raw)
+                return _write_png(save_dir, width, height, buf.raw)
             finally:
                 GDI32.DeleteObject(hbmp)
         finally:

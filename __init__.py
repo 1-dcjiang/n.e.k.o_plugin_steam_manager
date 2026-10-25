@@ -21,6 +21,23 @@ from plugin.sdk.plugin import (
 from . import control, steam
 
 
+def _to_png(bmp_path: str) -> str:
+    """把 BMP 截图转成 PNG 再返回（YUI 视觉通道只认 PNG/JPG，BMP 会读不出画面）。
+
+    转换失败时原样返回 BMP 路径（避免截图丢失），输出文本会如实标注。
+    """
+    if not bmp_path or not bmp_path.lower().endswith(".bmp"):
+        return bmp_path
+    try:
+        from PIL import Image
+
+        png_path = bmp_path[:-4] + ".png"
+        Image.open(bmp_path).convert("RGB").save(png_path, "PNG")
+        return png_path
+    except Exception:
+        return bmp_path
+
+
 @neko_plugin
 class SteamManagerPlugin(NekoPluginBase):
     """N.E.K.O. 插件：Steam 游戏库管理与游戏助手。"""
@@ -585,14 +602,16 @@ class SteamManagerPlugin(NekoPluginBase):
                 self._state.note_event("capture", f"{civ['title']} / {civ['process']} (printwindow)")
                 width = civ["rect"][2] - civ["rect"][0]
                 height = civ["rect"][3] - civ["rect"][1]
+                view_path = _to_png(path)
+                fmt_note = "（PNG，视觉可直接读取）" if view_path.endswith(".png") else "（BMP，视觉可能读不出，请让 YUI 改用 civ6_ops_peek）"
                 return {
                     "output": (
                         f"已截取文明6 游戏窗口画面（PrintWindow 直抓，被聊天/终端窗口遮挡也能拿到游戏本体）：\n"
                         f"窗口：{civ['title']}（进程 {civ['process']}，PID {civ['pid']}）\n"
-                        f"尺寸：{width}×{height}\n截图路径：{path}\n时间：{civ['ts']:.0f}"
+                        f"尺寸：{width}×{height}\n截图路径：{view_path}{fmt_note}\n时间：{civ['ts']:.0f}"
                     ),
                     "is_error": False,
-                    "screenshot": path,
+                    "screenshot": view_path,
                 }
         if not info:
             return {"output": "没有检测到前台窗口（可能窗口已最小化）。请确认游戏窗口在前台。", "is_error": True, "error": "NO_WINDOW"}
@@ -603,13 +622,15 @@ class SteamManagerPlugin(NekoPluginBase):
         self._state.note_event("capture", f"{info['title']} / {info['process']}")
         width = info["rect"][2] - info["rect"][0]
         height = info["rect"][3] - info["rect"][1]
+        view_path = _to_png(path)
+        fmt_note = "（PNG，视觉可直接读取）" if view_path.endswith(".png") else "（BMP，视觉可能读不出，请让 YUI 改用 civ6_ops_peek）"
         return {
             "output": (
                 f"已截取前台窗口画面：\n窗口：{info['title']}（进程 {info['process']}，PID {info['pid']}）\n"
-                f"尺寸：{width}×{height}\n截图路径：{path}\n时间：{info['ts']:.0f}"
+                f"尺寸：{width}×{height}\n截图路径：{view_path}{fmt_note}\n时间：{info['ts']:.0f}"
             ),
             "is_error": False,
-            "screenshot": path,
+            "screenshot": view_path,
         }
 
     @llm_tool(

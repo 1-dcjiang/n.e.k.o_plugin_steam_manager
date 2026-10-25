@@ -153,8 +153,10 @@ def test_write_bmp_header_and_size(tmp_path) -> None:
     assert offset == 40
     assert width == 4 and height == 2 and planes == 1 and bpp == 32
     file_size = len(data)
-    # 行 4px*3B=12 → 对齐 12；2 行 → 54 + 24 = 78
-    assert file_size == 54 + 12 * 2
+    # 4x2 的 32 位 BGRA：每行 4px*4B=16，2 行 → 54 + 16*2 = 86（数据与头部声明的
+    # biSizeImage 一致，PIL/视觉可正常解码；此前头部声明 32bit 却只写 3 字节/像素
+    # 的 24bit 数据，文件长度与头不符导致读图端报 truncated）
+    assert file_size == 54 + 16 * 2
 
 # ══════════ v0.3.1：帧目录清理回归测试 ══════════
 
