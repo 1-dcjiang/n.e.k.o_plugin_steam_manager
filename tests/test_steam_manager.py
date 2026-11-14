@@ -306,3 +306,98 @@ def test_open_app_scans_full_library(monkeypatch) -> None:
     assert result["is_error"] is False
     assert limits == [0]
     assert launched == ["999"]
+
+
+def test_reply_friend_substring_requires_confirm(monkeypatch) -> None:
+    """非数字昵称只有子串匹配时，先返回确认，不直接发送。"""
+    inst, steam = _reply_plugin(monkeypatch)
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(steam, "friend_list", lambda *a: [
+        {"steam_id": "76561198000000001", "name": "Alice Smith"},
+    ])
+    monkeypatch.setattr(steam, "send_friend_message", lambda _c, _s, target, text: sent.append((target, text)) or {"ok": True})
+
+    need = _run(inst.steam_reply_friend(friend="Alice", text="hi"))
+    assert need["error"] == "CONFIRM_REQUIRED"
+    assert sent == []
+
+    ok = _run(inst.steam_reply_friend(friend="Alice", text="hi", confirm=True))
+    assert ok["is_error"] is False
+    assert sent == [("76561198000000001", "hi")]
+
+
+def test_reply_friend_no_key_steam_id_requires_confirm(monkeypatch) -> None:
+    """没有 API Key 时，17 位 SteamID 也必须二次确认，不能盲发。"""
+    inst, steam = _reply_plugin(monkeypatch)
+    monkeypatch.setattr(steam, "api_key", lambda: "")
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(steam, "send_friend_message", lambda _c, _s, target, text: sent.append((target, text)) or {"ok": True})
+
+    need = _run(inst.steam_reply_friend(friend="76561198000000001", text="hi"))
+    assert need["error"] == "CONFIRM_REQUIRED"
+    assert sent == []
+
+    ok = _run(inst.steam_reply_friend(friend="76561198000000001", text="hi", confirm=True))
+    assert ok["is_error"] is False
+    assert sent == [("76561198000000001", "hi")]
+
+
+def test_reply_friend_partial_errors_surfaced_on_success(monkeypatch) -> None:
+    inst, steam = _reply_plugin(monkeypatch)
+
+    def _friends(_key, _sid, _limit, errors):
+        errors.append("第 1 批概要获取失败")
+        return [{"steam_id": "76561198000000001", "name": "Alice"}]
+
+    monkeypatch.setattr(steam, "friend_list", _friends)
+    monkeypatch.setattr(steam, "send_friend_message", lambda *a: {"ok": True})
+
+    result = _run(inst.steam_reply_friend(friend="Alice", text="hi"))
+    assert result["is_error"] is False
+    assert result["partial"] is True
+    assert "好友概要部分失败" in result["output"]
+
+
+def test_reply_friend_rejects_over_500_chars() -> None:
+    inst = _plugin()
+    result = _run(inst.steam_reply_friend(friend="Alice", text="x" * 501))
+    assert result["error"] == "TEXT_TOO_LONG"
+
+
+def test_credentials_partial_success_is_not_overall_error(monkeypatch, tmp_path) -> None:
+    """Key 成功、Cookie 失败：明确保留 Key 成功结果，不把整体报成失败。"""
+    from plugin.plugins.steam_manager import steam
+
+    writes: list[str] = []
+    monkeypatch.setattr(steam, "validate_api_key", lambda key: (True, "ok"))
+    monkeypatch.setattr(steam, "save_api_key", lambda key, path=None: writes.append(key) or str(tmp_path))
+    monkeypatch.setattr(steam, "validate_community_cookie", lambda c: (False, "sessionid 缺失"))
+    monkeypatch.setattr(steam, "save_community_cookie", lambda c, path=None: (_ for _ in ()).throw(AssertionError("不应写入")))
+    monkeypatch.setattr(steam, "credentials_status", lambda: {"api_key_configured": True, "cookie_configured": False, "can_use_friends": True, "can_reply_friend": False})
+    inst = _plugin()
+    result = _run(inst.steam_credentials(mode="yui", api_key="GOODKEY", cookie="BAD", parameters={}))
+    assert result["is_error"] is False
+    assert result["partial"] is True
+    assert "API Key：已加密写入并验证通过" in result["output"]
+    assert "Cookie：验证未通过，未写入" in result["output"]
+    assert writes == ["GOODKEY"]
+
+
+def test_open_app_uninstalled_requires_confirm(monkeypatch) -> None:
+    """未安装游戏不直接打开搜索第一条，必须先确认候选。"""
+    from plugin.plugins.steam_manager import steam
+
+    opened: list[str] = []
+    monkeypatch.setattr(steam, "find_game", lambda *a, **k: [])
+    monkeypatch.setattr(steam, "search_store", lambda *a, **k: [{"app_id": "123", "name": "Wrong Game"}])
+    monkeypatch.setattr(steam, "open_app", lambda _p, app_id, installed: opened.append(app_id) or {"ok": True, "output": "已打开"})
+    inst = _plugin()
+    inst._steam_path = "S"
+
+    need = _run(inst.steam_open_app(game="My Game"))
+    assert need["error"] == "CONFIRM_REQUIRED"
+    assert opened == []
+
+    ok = _run(inst.steam_open_app(game="My Game", confirm=True))
+    assert ok["is_error"] is False
+    assert opened == ["123"]

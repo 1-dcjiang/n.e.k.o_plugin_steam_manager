@@ -20,7 +20,7 @@ def test_pack_rules_exclude_credentials() -> None:
     rules = data["tool"]["neko"]["build"]["exclude_files"]
     assert "steam_api_key.txt" in rules
     assert "steam_cookie.txt" in rules
-    assert data["project"]["version"] == "0.4.3"
+    assert data["project"]["version"] == "0.4.4"
 
 
 def test_build_actually_excludes_credentials(tmp_path) -> None:
