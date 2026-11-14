@@ -10,6 +10,10 @@ on:
 
 permissions:
   contents: write
+  # 上游 plugin-market-release.yml 的 attest job 需要这两项；caller 不授予时
+  # GitHub 会在启动阶段直接 startup_failure。
+  id-token: write
+  attestations: write
 
 jobs:
   release:
