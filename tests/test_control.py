@@ -251,7 +251,6 @@ def test_input_struct_matches_win32_layout() -> None:
     import sys
 
     import pytest
-
     from plugin.plugins.steam_manager import control
 
     if os.name != "nt":
