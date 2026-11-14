@@ -4,3 +4,8 @@ __pycache__/
 .pytest_cache/
 store.db
 .ruff_cache/
+
+# 凭证绝不能进仓库
+steam_api_key.txt
+steam_cookie.txt
+*.tmp

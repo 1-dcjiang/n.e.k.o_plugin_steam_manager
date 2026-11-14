@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import logging
 import os
 import struct
 import threading
 import time
 from collections import deque
+
+_logger = logging.getLogger("N.E.K.O.Plugin_steam_manager.control")
 
 USER32 = GDI32 = KERNEL32 = PSAPI = None
 if os.name == "nt":
@@ -41,11 +44,33 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _GWL_STYLE = -16
 _WS_MINIMIZE = 0x20000000
 
+_KEYEVENTF_UNICODE = 0x0004
+_INPUT_KEYBOARD = 1
 _MAX_FRAMES = 20
 _MAX_TIMELINE = 120
 _MIN_INTERVAL = 1.0
+_MAX_FRAME_FILES = 40
 
 _FRAME_DIR = os.path.join(os.environ.get("TEMP", "."), "steam_manager", "frames")
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wt.WORD),
+        ("wScan", wt.WORD),
+        ("dwFlags", wt.DWORD),
+        ("time", wt.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wt.DWORD), ("u", _INPUTUNION)]
 
 
 class _Rect(wt.RECT):
@@ -181,8 +206,10 @@ def _write_png(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str
         img = Image.frombytes("RGBA", (width, height), dib_pixels, "raw", "BGRA").convert("RGB")
         path = os.path.join(save_dir, f"frame_{int(time.time() * 1000)}.png")
         img.save(path, "PNG")
+        cleanup_old_frames(save_dir)
         return path
-    except Exception:
+    except Exception as exc:
+        _logger.warning("PNG 写入失败，回退 BMP：%s", exc)
         return _write_bmp(save_dir, width, height, dib_pixels)
 
 
@@ -200,17 +227,22 @@ def _write_bmp(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str
     try:
         with open(path, "wb") as fh:
             fh.write(bytes(header) + dib_pixels[:data_size])
-    except OSError:
+    except OSError as exc:
+        _logger.warning("BMP 写入失败：%s", exc)
         return None
+    cleanup_old_frames(save_dir)
     return path
 
 
-def find_civ6_window() -> dict | None:
-    """查找文明6 主窗口（标题含 'Civilization VI'），返回与 get_foreground_window_info 同构的信息。
+def find_window_by_title(title_hint: str) -> dict | None:
+    """查找标题包含 title_hint 的可见窗口（不区分大小写），返回窗口信息。
 
-    用于 PrintWindow 直抓游戏画面：游戏被聊天/终端窗口遮挡时，前台窗口截图只能
-    截到遮挡层，而 PrintWindow 直接向文明6 窗口请求绘制，拿到的永远是游戏本体。"""
+    默认提示词为 Civilization VI，可通过插件配置 steam.game_window_title 改为其他游戏。
+    """
     if USER32 is None:
+        return None
+    hint = (title_hint or "").strip().casefold()
+    if not hint:
         return None
     found: list[int] = []
 
@@ -220,7 +252,7 @@ def find_civ6_window() -> dict | None:
             title_buf = ctypes.create_unicode_buffer(512)
             USER32.GetWindowTextW(hwnd, title_buf, 512)
             title = title_buf.value or ""
-            if "civilization vi" in title.casefold():
+            if hint in title.casefold():
                 found.append(hwnd)
                 return False
         return True
@@ -246,6 +278,11 @@ def find_civ6_window() -> dict | None:
         "rect": (rect.left, rect.top, rect.right, rect.bottom),
         "ts": time.time(),
     }
+
+
+def find_civ6_window() -> dict | None:
+    """兼容旧调用：查找文明6 主窗口。"""
+    return find_window_by_title("civilization vi")
 
 
 def capture_window_printwindow(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
@@ -309,12 +346,14 @@ def _screen_size() -> tuple[int, int]:
 
 
 def mouse_click_abs(screen_x: int, screen_y: int) -> None:
-    """在屏幕绝对坐标点击左键；非 Windows 为 no-op。"""
+    """在屏幕绝对坐标点击左键；坐标自动 clamp 到屏幕范围内。"""
     if USER32 is None:
         return
     sw, sh = _screen_size()
-    dx = int(screen_x * 65535 // max(1, sw - 1))
-    dy = int(screen_y * 65535 // max(1, sh - 1))
+    sx = max(0, min(sw - 1, int(screen_x)))
+    sy = max(0, min(sh - 1, int(screen_y)))
+    dx = int(sx * 65535 // max(1, sw - 1))
+    dy = int(sy * 65535 // max(1, sh - 1))
     extra = ctypes.c_ulong(0)
     USER32.mouse_event(_MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_MOVE, dx, dy, 0, extra)
     USER32.mouse_event(_MOUSEEVENTF_LEFTDOWN, 0, 0, 0, extra)
@@ -330,23 +369,52 @@ def press_key(vk: int) -> None:
     USER32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, extra)
 
 
-def type_text(text: str) -> None:
-    """逐字符输入 ASCII 文本（非 ASCII 会跳过并计数）。"""
-    typed = 0
+def _unicode_units(text: str) -> list[int]:
+    """把文本转成 SendInput 需要的 UTF-16 code unit 序列（支持中文与代理对）。"""
+    units: list[int] = []
     for ch in text:
-        code = ord(ch)
-        if code > 127:
-            continue
-        press_key(code)
-        typed += 1
+        raw = ch.encode("utf-16-le")
+        for i in range(0, len(raw), 2):
+            units.append(int.from_bytes(raw[i:i + 2], "little"))
+    return units
+
+
+def type_text(text: str) -> int:
+    """发送 Unicode 按键输入（大写、符号、中文均可），返回字符数。
+
+    此前逐字符 press_key(ord(ch)) 只适用于小写 ASCII：大写缺 Shift、':' 等
+    符号的 ASCII 码不是虚拟键码、非 ASCII 直接跳过。改用 KEYEVENTF_UNICODE。
+    """
+    if USER32 is None or not text:
+        return 0
+    units = _unicode_units(text)
+    if not units:
+        return 0
+    events = (_INPUT * (len(units) * 2))()
+    for idx, unit in enumerate(units):
+        for offset, flags in ((0, _KEYEVENTF_UNICODE), (1, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP)):
+            ev = events[idx * 2 + offset]
+            ev.type = _INPUT_KEYBOARD
+            ev.ki.wVk = 0
+            ev.ki.wScan = unit
+            ev.ki.dwFlags = flags
+            ev.ki.time = 0
+            ev.ki.dwExtraInfo = None
+    sent = USER32.SendInput(len(events), events, ctypes.sizeof(_INPUT))
+    if sent != len(events):
+        _logger.warning("SendInput 只发送了 %s/%s 个事件", sent, len(events))
+        return 0
+    return len(text)
 
 
 def window_client_to_screen(info: dict, rel_x: float, rel_y: float) -> tuple[int, int]:
-    """把窗口内相对坐标（0-1000 千分比）换算为屏幕绝对坐标。"""
+    """把窗口内相对坐标（0-1000 千分比）换算为屏幕绝对坐标（含右下边界 clamp）。"""
     left, top, right, bottom = info["rect"]
     w = max(1, right - left)
     h = max(1, bottom - top)
-    return left + int(w * rel_x / 1000), top + int(h * rel_y / 1000)
+    rel_x = max(0.0, min(1000.0, float(rel_x)))
+    rel_y = max(0.0, min(1000.0, float(rel_y)))
+    return left + min(w - 1, int(w * rel_x / 1000)), top + min(h - 1, int(h * rel_y / 1000))
 
 
 # ══════════ 状态机（纯逻辑，可测） ══════════
@@ -426,6 +494,35 @@ class ControlState:
 # ══════════ 后台监控线程 ══════════
 
 
+def cleanup_old_frames(save_dir: str | None = None, keep: int = _MAX_FRAME_FILES) -> int:
+    """删除帧目录中超出 keep 个的旧帧（同时覆盖 .png 与 .bmp），返回删除数。
+
+    v0.3.5 起帧格式改为 PNG，但旧清理只匹配 .bmp，导致 PNG 帧无限增长。
+    """
+    directory = save_dir or _FRAME_DIR
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return 0
+    files = [
+        os.path.join(directory, name)
+        for name in names
+        if name.startswith("frame_") and name.lower().endswith((".png", ".bmp"))
+    ]
+    try:
+        files.sort(key=os.path.getmtime, reverse=True)
+    except OSError:
+        return 0
+    removed = 0
+    for old in files[max(0, keep):]:
+        try:
+            os.remove(old)
+            removed += 1
+        except OSError as exc:
+            _logger.debug("清理旧帧失败 %s：%s", old, exc)
+    return removed
+
+
 class FrameWatcher:
     """周期截取前台窗口画面的后台线程。"""
 
@@ -450,29 +547,18 @@ class FrameWatcher:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            info = get_foreground_window_info()
-            if info:
-                path = capture_window_bmp(info)
-                if path:
-                    self._state.note_frame(info, path)
-                    self._state.note_event("frame", f"{info.get('title', '')} / {info.get('process', '')}")
-            self._cleanup_old_frames()
+            try:
+                info = get_foreground_window_info()
+                if info:
+                    path = capture_window_bmp(info)
+                    if path:
+                        self._state.note_frame(info, path)
+                        self._state.note_event("frame", f"{info.get('title', '')} / {info.get('process', '')}")
+                self._cleanup_old_frames()
+            except Exception as exc:  # 后台线程不能因单帧异常退出
+                _logger.warning("帧监控循环异常：%s", exc)
             self._stop.wait(self._interval)
 
-    def _cleanup_old_frames(self, keep: int = 40) -> None:
-        """v0.3.1 修复：帧目录无上限膨胀（BMP 每帧数 MB，监控数小时可达数 GB）。
-
-        每次循环清理一次：只保留最近 keep 个帧文件，其余删除。
-        """
-        try:
-            files = sorted(
-                os.path.join(_FRAME_DIR, f) for f in os.listdir(_FRAME_DIR)
-                if f.startswith("frame_") and f.endswith(".bmp")
-            )
-        except OSError:
-            return
-        for old in files[:-keep]:
-            try:
-                os.remove(old)
-            except OSError:
-                pass
+    def _cleanup_old_frames(self, keep: int = _MAX_FRAME_FILES) -> None:
+        """兼容旧测试/调用：清理 _FRAME_DIR 中旧帧。"""
+        cleanup_old_frames(_FRAME_DIR, keep)

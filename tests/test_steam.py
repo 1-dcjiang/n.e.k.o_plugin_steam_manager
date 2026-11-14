@@ -312,8 +312,12 @@ def test_save_api_key_and_cookie(tmp_path) -> None:
     cookie_path = steam.save_community_cookie("sessionid=x; steamLoginSecure=y", path=str(tmp_path / "steam_cookie.txt"))
     assert key_path.endswith("steam_api_key.txt")
     assert cookie_path.endswith("steam_cookie.txt")
-    assert open(key_path, encoding="utf-8").read().strip() == "ABCDEF012345"
-    assert "sessionid=x" in open(cookie_path, encoding="utf-8").read()
+    assert steam._read_secret_file(key_path) == "ABCDEF012345"
+    assert "sessionid=x" in steam._read_secret_file(cookie_path)
+    if steam._dpapi_available():
+        raw = open(key_path, "rb").read()
+        assert steam._CREDENTIAL_MARKER.encode() in raw
+        assert b"ABCDEF012345" not in raw  # 落盘必须是 DPAPI 密文
 
 
 def test_save_api_key_empty_raises(tmp_path) -> None:
@@ -346,11 +350,11 @@ def test_validate_api_key_invalid(monkeypatch) -> None:
 
 
 def test_validate_api_key_forbidden(monkeypatch) -> None:
-    """无效 Key 实测返回 HTTP 403（而非 code=101），归类为无效。"""
+    """无效 Key 返回结构化 HTTP 403，归类为无效（不再靠字符串匹配）。"""
     from plugin.plugins.steam_manager import steam
 
     def _raise(_url):
-        raise OSError("HTTP Error 403: Forbidden")
+        raise steam.SteamHTTPError(403, "Forbidden")
 
     monkeypatch.setattr(steam, "_http_get_json", _raise)
     ok, msg = steam.validate_api_key("BAD")
@@ -392,62 +396,146 @@ def test_credentials_status() -> None:
     assert status["can_use_friends"] == status["api_key_configured"]
     assert status["can_reply_friend"] == (status["api_key_configured"] and status["cookie_configured"])
 
-# ══════════ v0.3.2：浏览器 Cookie 自动探测 ══════════
+
+# ══════════ v0.4.1：凭证落盘/脱敏/重试/部分失败 ══════════
 
 
-def test_decrypt_cookie_value_v10_ok(monkeypatch) -> None:
-    """v10 加密值可被 AES-GCM 解密；非 v10 原样返回。"""
-    import os
-    import sys
-
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+def test_credentials_default_path_in_localappdata(monkeypatch, tmp_path) -> None:
+    """默认凭证路径必须在用户数据目录，不在插件源码目录。"""
     from plugin.plugins.steam_manager import steam
 
-    aes_key = os.urandom(32)
-    nonce = os.urandom(12)
-    ct = AESGCM(aes_key).encrypt(nonce, b"sessionvalue123", None)
-    encrypted = b"v10" + nonce + ct
-    assert steam._decrypt_cookie_value(encrypted, aes_key) == "sessionvalue123"
-    assert steam._decrypt_cookie_value(b"plain-text", aes_key) == "plain-text"
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.delenv("STEAM_MANAGER_DATA_DIR", raising=False)
+    path = steam.save_api_key("KEY-OUTSIDE")
+    assert path == str(tmp_path / "N.E.K.O" / "steam_manager" / "steam_api_key.txt")
+    assert steam._read_secret_file(path) == "KEY-OUTSIDE"
 
 
-def test_probe_browser_cookies_no_browser_db(monkeypatch, tmp_path) -> None:
-    """无浏览器 Cookie 库时返回 found=False 且不抛错。"""
+def test_legacy_plaintext_credential_migrates(monkeypatch, tmp_path) -> None:
+    """旧版插件目录明文凭证读取后迁移为加密文件并删除旧文件。"""
     from plugin.plugins.steam_manager import steam
 
-    monkeypatch.setattr(steam, "_iter_browser_cookie_dbs", lambda: [])
-    result = steam.probe_browser_cookies()
-    assert result["found"] is False
-    assert result["sessionid"] == ""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.delenv("STEAM_MANAGER_DATA_DIR", raising=False)
+    monkeypatch.delenv("STEAM_API_KEY", raising=False)
+    legacy = tmp_path / "legacy_key.txt"
+    legacy.write_text("LEGACY-KEY", encoding="utf-8")
+    monkeypatch.setattr(steam, "_legacy_credential_path", lambda _name: str(legacy))
+    assert steam.api_key() == "LEGACY-KEY"
+    assert not legacy.exists()
+    assert steam._read_secret_file(steam._credential_path("steam_api_key.txt")) == "LEGACY-KEY"
 
 
-def test_probe_browser_cookies_finds_session(monkeypatch, tmp_path) -> None:
-    """探测到 sessionid 时正确返回（不依赖真实浏览器）。"""
+def test_redact_text_masks_api_key_and_cookie() -> None:
     from plugin.plugins.steam_manager import steam
 
-    rows = [("sessionid", "", b"v10"), ("steamLoginSecure", "", b"v10")]
-    monkeypatch.setattr(steam, "_iter_browser_cookie_dbs", lambda: [("fake.db", "fake.json")])
+    text = "GET https://api.steampowered.com/x?key=SECRET123&steamids=1 Cookie: sessionid=abc; steamLoginSecure=xyz"
+    masked = steam.redact_text(text)
+    assert "SECRET123" not in masked
+    assert "abc" not in masked
+    assert "xyz" not in masked
+    assert "key=[redacted]" in masked
 
-    import os
-    import sqlite3
 
-    db = os.path.join(str(tmp_path), "cookies.db")
-    con = sqlite3.connect(db)
-    con.execute("CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT)")
-    for n, v, e in rows:
-        con.execute("INSERT INTO cookies VALUES (?,?,?,?)", (n, v, e, "steamcommunity.com"))
-    con.commit()
-    con.close()
+def test_http_get_json_retries_429_then_succeeds(monkeypatch) -> None:
+    """429 会按 Retry-After 退避重试，第二次成功返回 JSON。"""
+    import io
+    import json
+    import urllib.error
 
-    def _fake_copy(src, dst):
-        import shutil
+    from plugin.plugins.steam_manager import steam
 
-        shutil.copyfile(db, dst)
+    calls: list[str] = []
 
-    monkeypatch.setattr(steam, "_copy_cookie_db", _fake_copy)
-    monkeypatch.setattr(steam, "_decrypt_cookie_value", lambda enc, key: b"decoded-value".decode() if enc == b"v10" else "")
-    monkeypatch.setattr(steam, "_chrome_aes_key", lambda path: b"k" * 32)
-    result = steam.probe_browser_cookies()
-    assert result["sessionid"] == "decoded-value"
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"ok": True}).encode()
+
+    class _Headers:
+        @staticmethod
+        def get(name):
+            return "0" if name == "Retry-After" else None
+
+    def _fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", _Headers(), io.BytesIO(b""))
+        return _Resp()
+
+    monkeypatch.setattr(steam.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(steam.time, "sleep", lambda _s: None)
+    result = steam._http_get_json("https://api.steampowered.com/x?key=SECRET")
+    assert result == {"ok": True}
+    assert len(calls) == 2
+
+
+def test_http_get_json_403_not_retried(monkeypatch) -> None:
+    import io
+    import urllib.error
+
+    from plugin.plugins.steam_manager import steam
+
+    calls: list[str] = []
+
+    def _fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(b""))
+
+    monkeypatch.setattr(steam.urllib.request, "urlopen", _fake_urlopen)
+    try:
+        steam._http_get_json("https://api.steampowered.com/x?key=SECRET")
+        raise AssertionError("应当抛 SteamHTTPError")
+    except steam.SteamHTTPError as exc:
+        assert exc.status == 403
+        assert "SECRET" not in str(exc)
+    assert len(calls) == 1
+
+
+def test_summaries_in_chunks_records_partial_failure(monkeypatch) -> None:
+    """某批概要失败时写入 errors，不静默丢批次。"""
+    from plugin.plugins.steam_manager import steam
+
+    def _fake_get(url, referer=None, timeout=15.0):
+        if "steamids=2" in url:
+            raise steam.SteamHTTPError(503, "Unavailable")
+        return {"response": {"players": [{"steamid": "1", "personaname": "P1"}]}}
+
+    monkeypatch.setattr(steam, "_http_get_json", _fake_get)
+    errors: list[str] = []
+    info = steam._summaries_in_chunks("KEY", ["1", "2"], chunk=1, errors=errors)
+    assert "1" in info
+    assert len(errors) == 1
+    assert "503" in errors[0]
+
+
+def test_friend_list_marks_partial(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    def _fake_get(url, referer=None, timeout=15.0):
+        if "GetFriendList" in url:
+            return {"friendslist": {"friends": [{"steamid": "1"}, {"steamid": "2"}]}}
+        raise steam.SteamHTTPError(502, "Bad Gateway")
+
+    monkeypatch.setattr(steam, "_http_get_json", _fake_get)
+    errors: list[str] = []
+    friends = steam.friend_list("KEY", "7656119", errors=errors)
+    assert len(friends) == 2
+    assert all(f["summary_ok"] is False for f in friends)
+    assert errors
+
+
+def test_launch_game_rejects_traversal_exe(tmp_path) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    base = tmp_path / "Steam"
+    base.mkdir()
+    # 在父目录放 steam.exe，再让 base 下只放指向它的 junction/文件副本不现实；
+    # 直接验证非绝对路径与缺少 exe 都返回结构化错误。
+    assert steam.launch_game("relative-path", "730")["error"] == "STEAM_NOT_FOUND"
+    assert steam.launch_game(str(base), "730")["error"] == "STEAM_EXE_NOT_FOUND"

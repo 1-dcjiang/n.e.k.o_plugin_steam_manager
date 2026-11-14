@@ -1,13 +1,16 @@
-"""steam_manager — Steam 管理 + 游戏助手。
+"""steam_manager — Steam 管理 + 游戏助手（v0.4.1）。
 
 安全边界：只读本地库元数据；启动游戏需用户明确指令；截图与行为跟踪
 仅在用户开启监控后运行；键鼠接管（YUI 操作游戏）默认关闭，必须由
 用户显式授权（take_control），且仅作用于当前前台游戏窗口；不读取
-账号、凭据、云存档等敏感数据。
+账号密码、不自动探测浏览器 Cookie；API Key / Cookie 仅存于用户数据目录
+并以 DPAPI 加密，异常与日志不回显完整 URL。
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import time
 import webbrowser
@@ -21,6 +24,8 @@ from plugin.sdk.plugin import (
 )
 
 from . import control, steam
+
+_logger = logging.getLogger("N.E.K.O.Plugin_steam_manager")
 
 
 def _to_png(bmp_path: str) -> str:
@@ -36,7 +41,8 @@ def _to_png(bmp_path: str) -> str:
         png_path = bmp_path[:-4] + ".png"
         Image.open(bmp_path).convert("RGB").save(png_path, "PNG")
         return png_path
-    except Exception:
+    except Exception as exc:
+        _logger.warning("BMP->PNG 转换失败，保留 BMP：%s", exc)
         return bmp_path
 
 
@@ -69,7 +75,8 @@ def _image_entry(image_path: str) -> list | None:
         buf = BytesIO()
         im.save(buf, "JPEG", quality=82)
         return [{"data_b64": base64.b64encode(buf.getvalue()).decode("ascii"), "mime": "image/jpeg"}]
-    except Exception:
+    except Exception as exc:
+        _logger.warning("截图读取/编码失败：%s", exc)
         return None
 
 
@@ -82,6 +89,7 @@ class SteamManagerPlugin(NekoPluginBase):
         self._steam_path: str | None = None
         self._state = control.ControlState()
         self._watcher = control.FrameWatcher(self._state)
+        self._game_window_title = "civilization vi"
 
     # ══════════ 跨插件优先级：civ6 运营锁让位 ══════════
     # civ6_buddy 运营托管期间写 `%LOCALAPPDATA%\N.E.K.O\config\civ6_ops_active`（带时间戳），
@@ -92,11 +100,24 @@ class SteamManagerPlugin(NekoPluginBase):
         p = os.path.join(os.environ.get("LOCALAPPDATA", ""), "N.E.K.O", "config", "civ6_ops_active")
         if not p or not os.path.isfile(p):
             return None
+        lock_ts: float | None = None
         try:
-            fresh = (time.time() - os.path.getmtime(p)) < self._CIV6_OPS_LOCK_TTL
-        except OSError:
+            # 优先读文件内时间戳，避免跨进程写文件时 mtime 读到半截/旧值
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                content = fh.read(64).strip()
+            if content:
+                lock_ts = float(content.split()[0])
+        except (OSError, ValueError):
+            lock_ts = None
+        if lock_ts is None:
+            try:
+                lock_ts = os.path.getmtime(p)
+            except OSError:
+                return None
+        now = time.time()
+        if lock_ts > now + 60:  # 时钟漂移/未来时间戳不应长期封锁
             return None
-        if not fresh:
+        if (now - lock_ts) >= self._CIV6_OPS_LOCK_TTL:
             return None
         return {
             "output": (
@@ -112,12 +133,21 @@ class SteamManagerPlugin(NekoPluginBase):
 
     @lifecycle(id="startup")
     async def on_startup(self, **_):
-        self._steam_path = steam.find_steam_path()
+        try:
+            cfg = await self.config.dump(timeout=5.0)
+        except Exception as exc:
+            _logger.warning("读取配置失败，使用默认窗口标题：%s", exc)
+            cfg = {}
+        steam_cfg = cfg.get("steam") if isinstance(cfg, dict) and isinstance(cfg.get("steam"), dict) else {}
+        hint = str(steam_cfg.get("game_window_title") or "").strip()
+        if hint:
+            self._game_window_title = hint
+        self._steam_path = await asyncio.to_thread(steam.find_steam_path)
         return {"status": "ready", "plugin": "steam_manager"}
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_):
-        self._watcher.stop()
+        await asyncio.to_thread(self._watcher.stop)
         self._state.disable_watch()
         self._state.disable_control()
         return {"status": "shutdown"}
@@ -137,10 +167,10 @@ class SteamManagerPlugin(NekoPluginBase):
         _y = self._civ6_ops_yield()
         if _y:
             return _y
-        path = self._steam_path or steam.find_steam_path()
+        path = self._steam_path or await asyncio.to_thread(steam.find_steam_path)
         if not path:
             return {"output": "未检测到 Steam 安装目录。请确认已安装 Steam 客户端（常见路径 C:\\Program Files (x86)\\Steam）。", "is_error": True, "error": "STEAM_NOT_FOUND"}
-        running = steam.steam_running()
+        running = await asyncio.to_thread(steam.steam_running)
         return {
             "output": f"Steam 安装路径：{path}\n客户端运行中：{'是' if running else '否'}",
             "is_error": False,
@@ -173,10 +203,10 @@ class SteamManagerPlugin(NekoPluginBase):
         except (TypeError, ValueError):
             limit = 50
         limit = max(1, min(limit, 200))
-        path = self._steam_path or steam.find_steam_path()
+        path = self._steam_path or await asyncio.to_thread(steam.find_steam_path)
         if not path:
             return {"output": "未检测到 Steam 安装目录，无法读取游戏库。", "is_error": True, "error": "STEAM_NOT_FOUND"}
-        games = steam.find_game(path, keyword, limit=limit)
+        games = await asyncio.to_thread(steam.find_game, path, keyword, limit=limit)
         installed = [g for g in games if g["installed"]]
         if not installed:
             return {"output": f"未找到匹配的已安装游戏（关键词：{keyword or '全部'}）。", "is_error": True, "error": "NO_MATCH"}
@@ -214,10 +244,10 @@ class SteamManagerPlugin(NekoPluginBase):
         game = (game or params.get("game") or "").strip()
         if not game:
             return {"output": "请告诉我你想启动哪个游戏（名称或 AppID）。", "is_error": True, "error": "NO_GAME"}
-        path = self._steam_path or steam.find_steam_path()
+        path = self._steam_path or await asyncio.to_thread(steam.find_steam_path)
         if not path:
             return {"output": "未检测到 Steam 安装目录，无法启动游戏。", "is_error": True, "error": "STEAM_NOT_FOUND"}
-        matches = steam.find_game(path, game)
+        matches = await asyncio.to_thread(steam.find_game, path, game)
         installed = [g for g in matches if g["installed"]]
         if not installed:
             return {"output": f"未找到已安装的游戏「{game}」。可先用 list_games 查看游戏库。", "is_error": True, "error": "NO_MATCH"}
@@ -225,20 +255,20 @@ class SteamManagerPlugin(NekoPluginBase):
             candidates = "、".join(f"{g['name']}（{g['app_id']}）" for g in installed[:10])
             return {"output": f"「{game}」匹配到多个游戏，请指定精确名称或 AppID：{candidates}", "is_error": True, "error": "AMBIGUOUS"}
         target = installed[0]
-        result = steam.launch_game(path, target["app_id"])
+        result = await asyncio.to_thread(steam.launch_game, path, target["app_id"])
         if not result.get("ok"):
             return {"output": result.get("output", "启动失败。"), "is_error": True, "error": result.get("error", "LAUNCH_FAILED")}
         return {"output": f"正在启动「{target['name']}」（AppID {target['app_id']}）。", "is_error": False}
 
     # ══════════ 账号 / 好友 / 价格 / 促销（v0.3.0） ══════════
 
-    def _steam_id(self, steam_id: str) -> str:
+    async def _steam_id(self, steam_id: str) -> str:
         """解析 steam_id：显式参数优先，否则读本地最近登录账号。"""
         steam_id = (steam_id or "").strip()
         if steam_id:
             return steam_id
-        path = self._steam_path or steam.find_steam_path()
-        local = steam.read_local_account(path)
+        path = self._steam_path or await asyncio.to_thread(steam.find_steam_path)
+        local = await asyncio.to_thread(steam.read_local_account, path)
         return (local or {}).get("steam_id") or ""
 
     @llm_tool(
@@ -262,13 +292,13 @@ class SteamManagerPlugin(NekoPluginBase):
             return _y
         params = _.get("parameters") or {}
         steam_id = (steam_id or params.get("steam_id") or "").strip()
-        path = self._steam_path or steam.find_steam_path()
-        local = steam.read_local_account(path)
-        key = steam.api_key()
+        path = self._steam_path or await asyncio.to_thread(steam.find_steam_path)
+        local = await asyncio.to_thread(steam.read_local_account, path)
+        key = await asyncio.to_thread(steam.api_key)
         if not local and not steam_id and not key:
             return {
                 "output": "未读取到 Steam 本地账号（未检测到 Steam 安装目录，或 config/loginusers.vdf 不存在），也未配置 STEAM_API_KEY。\n"
-                "可用方式：安装并登录 Steam 客户端，或配置 STEAM_API_KEY（环境变量 / 插件目录 steam_api_key.txt）。",
+                "可用方式：安装并登录 Steam 客户端，或用 steam_credentials(mode=\"yui\", api_key=...) 配置 API Key。",
                 "is_error": True,
                 "error": "NO_ACCOUNT",
             }
@@ -280,7 +310,7 @@ class SteamManagerPlugin(NekoPluginBase):
             lines.append(f"本地最近登录账号：{local['name'] or '未知'}（SteamID {local['steam_id']}）")
         if key and sid:
             try:
-                info = steam.account_info(key, sid)
+                info = await asyncio.to_thread(steam.account_info, key, sid)
                 if info:
                     lines.append(f"账户名：{info['name']}")
                     lines.append(f"在线状态：{info['state']}")
@@ -288,7 +318,7 @@ class SteamManagerPlugin(NekoPluginBase):
                     lines.append(f"资料页：{info['url']}")
                     return {"output": "\n".join(lines), "is_error": False, "account": info}
             except (OSError, ValueError) as exc:
-                lines.append(f"在线账户信息查询失败：{exc}")
+                lines.append(f"在线账户信息查询失败：{steam.redact_text(exc)}")
         elif key and not sid:
             lines.append("已配置 STEAM_API_KEY，但未读取到本地 SteamID；请传 steam_id 参数或登录 Steam 客户端。")
         return {"output": "\n".join(lines), "is_error": False}
@@ -297,7 +327,7 @@ class SteamManagerPlugin(NekoPluginBase):
         name="steam_friends",
         description=(
             "读取 Steam 好友列表及好友信息。何时用：用户问'我的 Steam 好友有哪些/好友列表/XX 在不在线/看看好友'时。"
-            "需要配置 STEAM_API_KEY（环境变量或插件目录 steam_api_key.txt）。"
+            "需要配置 STEAM_API_KEY（环境变量或 DPAPI 加密凭证）。"
             "参数 steam_id：可选，默认查询本地最近登录账号；name_filter：可选，按昵称过滤好友。"
             "返回每个好友的昵称、SteamID、在线状态。"
         ),
@@ -317,30 +347,40 @@ class SteamManagerPlugin(NekoPluginBase):
         params = _.get("parameters") or {}
         steam_id = (steam_id or params.get("steam_id") or "").strip()
         name_filter = (name_filter or params.get("name_filter") or "").strip()
-        key = steam.api_key()
+        key = await asyncio.to_thread(steam.api_key)
         if not key:
-            return {"output": "查询好友列表需要 Steam Web API Key。请配置 STEAM_API_KEY（环境变量）或把 Key 写入插件目录的 steam_api_key.txt。", "is_error": True, "error": "NO_API_KEY"}
-        sid = self._steam_id(steam_id)
+            return {"output": "查询好友列表需要 Steam Web API Key。请用 steam_credentials(mode=\"yui\", api_key=...) 配置，或设置环境变量 STEAM_API_KEY。", "is_error": True, "error": "NO_API_KEY"}
+        sid = await self._steam_id(steam_id)
         if not sid:
             return {"output": "未读取到本地 SteamID。请登录 Steam 客户端或传入 steam_id 参数。", "is_error": True, "error": "NO_STEAM_ID"}
+        errors: list[str] = []
         try:
-            friends = steam.friend_list(key, sid)
+            friends = await asyncio.to_thread(steam.friend_list, key, sid, 200, errors)
         except (OSError, ValueError) as exc:
-            return {"output": f"好友列表查询失败：{exc}", "is_error": True, "error": "FRIEND_LIST_FAILED"}
+            return {"output": f"好友列表查询失败：{steam.redact_text(exc)}", "is_error": True, "error": "FRIEND_LIST_FAILED"}
         if not friends:
             return {"output": "未获取到好友列表（可能是 API Key 无效、隐私设置或没有好友）。", "is_error": True, "error": "NO_FRIENDS"}
         if name_filter:
             friends = [f for f in friends if name_filter.lower() in f["name"].lower()]
             if not friends:
                 return {"output": f"没有昵称匹配「{name_filter}」的好友。", "is_error": True, "error": "NO_MATCH"}
-        lines = [f"{f['name']}（{f['state']}，SteamID {f['steam_id']}）" for f in friends]
-        return {"output": f"共 {len(friends)} 位好友：\n" + "\n".join(lines), "is_error": False, "friends": friends}
+        lines = [f"{f['name'] or '（昵称缺失）'}（{f['state']}，SteamID {f['steam_id']}）" for f in friends]
+        note = ""
+        if errors:
+            note = f"\n⚠ 部分好友概要获取失败（{len(errors)} 批），缺失昵称/状态的条目已保留 SteamID：\n" + "\n".join(errors)
+        return {
+            "output": f"共 {len(friends)} 位好友：\n" + "\n".join(lines) + note,
+            "is_error": False,
+            "friends": friends,
+            "partial": bool(errors),
+            "warnings": errors,
+        }
 
     @llm_tool(
         name="steam_reply_friend",
         description=(
             "给 Steam 好友发送一条消息（网页聊天）。何时用：用户明确要求'给 XX 发消息/回复好友/跟 XX 说一句'时。"
-            "需要：① STEAM_API_KEY（解析好友名→SteamID）；② steam_cookie.txt（steamcommunity 登录 cookie，含 sessionid）。"
+            "需要：① STEAM_API_KEY（解析好友名→SteamID）；② steamcommunity 登录 Cookie（含 sessionid，DPAPI 加密保存）。"
             "参数 friend：好友昵称或 64 位 SteamID；text：消息内容（最长 500 字）。"
             "安全：这是对外写操作，仅在用户明确要求发送时调用；发送成功后原样回复'已发送。'，不复述消息内容。"
         ),
@@ -363,32 +403,34 @@ class SteamManagerPlugin(NekoPluginBase):
         text = (text or params.get("text") or "").strip()
         if not friend or not text:
             return {"output": "请提供好友（昵称或 SteamID）和消息内容。", "is_error": True, "error": "EMPTY"}
-        key = steam.api_key()
-        cookie = steam.community_cookie()
+        key = await asyncio.to_thread(steam.api_key)
+        cookie = await asyncio.to_thread(steam.community_cookie)
         if not cookie:
-            return {"output": "回复好友需要 steamcommunity 登录 cookie。请把登录后浏览器 Cookie 写入插件目录 steam_cookie.txt（需含 sessionid）。", "is_error": True, "error": "NO_COOKIE"}
-        sid = self._steam_id("")
+            return {"output": "回复好友需要 steamcommunity 登录 cookie。请用 steam_credentials 写入 Cookie（需含 sessionid）。", "is_error": True, "error": "NO_COOKIE"}
+        sid = await self._steam_id("")
         if not sid:
             return {"output": "未读取到本地 SteamID（需先登录 Steam 客户端，用于确认发消息人身份）。", "is_error": True, "error": "NO_STEAM_ID"}
         friend_sid = friend if friend.isdigit() else ""
         if not friend_sid:
             if not key:
                 return {"output": "要用好友昵称发消息需要 STEAM_API_KEY（用于把昵称解析为 SteamID）。", "is_error": True, "error": "NO_API_KEY"}
+            errors: list[str] = []
             try:
-                friends = steam.friend_list(key, sid)
+                friends = await asyncio.to_thread(steam.friend_list, key, sid, 200, errors)
             except (OSError, ValueError) as exc:
-                return {"output": f"好友列表查询失败：{exc}", "is_error": True, "error": "FRIEND_LIST_FAILED"}
+                return {"output": f"好友列表查询失败：{steam.redact_text(exc)}", "is_error": True, "error": "FRIEND_LIST_FAILED"}
             matches = [f for f in friends if friend.lower() in f["name"].lower()]
             if not matches:
-                return {"output": f"在好友列表中没有找到「{friend}」。可先用 steam_friends 查看好友。", "is_error": True, "error": "NO_FRIEND"}
+                extra = "（好友概要部分失败，可能漏匹配）" if errors else ""
+                return {"output": f"在好友列表中没有找到「{friend}」{extra}。可先用 steam_friends 查看好友。", "is_error": True, "error": "NO_FRIEND"}
             if len(matches) > 1:
-                cand = "、".join(f"{f['name']}（{f['steam_id']}）" for f in matches[:8])
+                cand = "、".join(f"{f['name'] or f['steam_id']}（{f['steam_id']}）" for f in matches[:8])
                 return {"output": f"「{friend}」匹配到多个好友，请指定 SteamID：{cand}", "is_error": True, "error": "AMBIGUOUS"}
             friend_sid = matches[0]["steam_id"]
         try:
-            result = steam.send_friend_message(cookie, sid, friend_sid, text)
-        except ValueError as exc:
-            return {"output": str(exc), "is_error": True, "error": "SEND_FAILED"}
+            result = await asyncio.to_thread(steam.send_friend_message, cookie, sid, friend_sid, text)
+        except (OSError, ValueError) as exc:
+            return {"output": steam.redact_text(exc), "is_error": True, "error": "SEND_FAILED"}
         return {"output": "已发送。", "is_error": False, "result": result}
 
     @llm_tool(
@@ -416,14 +458,14 @@ class SteamManagerPlugin(NekoPluginBase):
             return {"output": "请提供要查价格的游戏名称或 AppID。", "is_error": True, "error": "NO_GAME"}
         try:
             if game.isdigit():
-                info = steam.app_price(game)
+                info = await asyncio.to_thread(steam.app_price, game)
                 if not info:
                     return {"output": f"未找到 AppID {game} 的价格信息（可能不存在或商店接口无数据）。", "is_error": True, "error": "NOT_FOUND"}
                 price = "免费" if info["free"] else f"{info['price_cny']:.2f} 元"
                 original = "" if info["free"] else f"（原价 {info['original_cny']:.2f} 元）" if info["original_cny"] else ""
                 disc = f"，折扣 {info['discount']}%" if info["discount"] else ""
                 return {"output": f"{info['name']}（AppID {info['app_id']}）：{price}{original}{disc}", "is_error": False, "price": info}
-            results = steam.search_store(game, limit=3)
+            results = await asyncio.to_thread(steam.search_store, game, 3)
             if not results:
                 return {"output": f"在 Steam 商店未搜到「{game}」。", "is_error": True, "error": "NOT_FOUND"}
             lines = []
@@ -436,7 +478,7 @@ class SteamManagerPlugin(NekoPluginBase):
                     lines.append(f"{r['name']}（AppID {r['app_id']}）：{r['price_cny']:.2f} 元{orig}{disc}")
             return {"output": "\n".join(lines), "is_error": False, "results": results}
         except (OSError, ValueError) as exc:
-            return {"output": f"价格查询失败：{exc}", "is_error": True, "error": "PRICE_FAILED"}
+            return {"output": f"价格查询失败：{steam.redact_text(exc)}", "is_error": True, "error": "PRICE_FAILED"}
 
     @llm_tool(
         name="steam_promotions",
@@ -463,9 +505,9 @@ class SteamManagerPlugin(NekoPluginBase):
             limit = 15
         limit = max(1, min(limit, 30))
         try:
-            items = steam.store_promotions(limit=limit)
+            items = await asyncio.to_thread(steam.store_promotions, limit)
         except (OSError, ValueError) as exc:
-            return {"output": f"促销查询失败：{exc}", "is_error": True, "error": "PROMO_FAILED"}
+            return {"output": f"促销查询失败：{steam.redact_text(exc)}", "is_error": True, "error": "PROMO_FAILED"}
         if not items:
             return {"output": "当前没有拉取到特惠游戏（可能接口无数据）。", "is_error": True, "error": "NO_PROMO"}
         lines = []
@@ -499,11 +541,15 @@ class SteamManagerPlugin(NekoPluginBase):
         game = (game or params.get("game") or "").strip()
         if not game:
             return {"output": "请提供要打开的游戏名称或 AppID。", "is_error": True, "error": "NO_GAME"}
-        path = self._steam_path or steam.find_steam_path()
+        path = self._steam_path or await asyncio.to_thread(steam.find_steam_path)
         app_id = game if game.isdigit() else ""
         installed = False
         if path:
-            matches = steam.find_game(path, game) if not app_id else [g for g in steam.scan_games(path, limit=200) if g["app_id"] == app_id]
+            if not app_id:
+                matches = await asyncio.to_thread(steam.find_game, path, game)
+            else:
+                all_games = await asyncio.to_thread(steam.scan_games, path, 200)
+                matches = [g for g in all_games if g["app_id"] == app_id]
             installed_matches = [g for g in matches if g["installed"]]
             if installed_matches:
                 if len(installed_matches) > 1:
@@ -516,40 +562,39 @@ class SteamManagerPlugin(NekoPluginBase):
                 installed = False
             else:
                 try:
-                    results = steam.search_store(game, limit=1)
+                    results = await asyncio.to_thread(steam.search_store, game, 1)
                 except (OSError, ValueError) as exc:
-                    return {"output": f"搜索「{game}」失败：{exc}", "is_error": True, "error": "SEARCH_FAILED"}
+                    return {"output": f"搜索「{game}」失败：{steam.redact_text(exc)}", "is_error": True, "error": "SEARCH_FAILED"}
                 if not results:
                     return {"output": f"在 Steam 商店未搜到「{game}」，无法打开。", "is_error": True, "error": "NOT_FOUND"}
                 app_id = results[0]["app_id"]
         elif not app_id:
             try:
-                results = steam.search_store(game, limit=1)
+                results = await asyncio.to_thread(steam.search_store, game, 1)
             except (OSError, ValueError) as exc:
-                return {"output": f"搜索「{game}」失败：{exc}", "is_error": True, "error": "SEARCH_FAILED"}
+                return {"output": f"搜索「{game}」失败：{steam.redact_text(exc)}", "is_error": True, "error": "SEARCH_FAILED"}
             if not results:
                 return {"output": f"在 Steam 商店未搜到「{game}」。", "is_error": True, "error": "NOT_FOUND"}
             app_id = results[0]["app_id"]
         if not app_id:
             return {"output": "未能确定 AppID。", "is_error": True, "error": "NO_APP_ID"}
-        result = steam.open_app(path, app_id, installed)
+        result = await asyncio.to_thread(steam.open_app, path, app_id, installed)
         if not result.get("ok"):
             return {"output": result.get("output", "打开失败。"), "is_error": True, "error": result.get("error", "OPEN_FAILED")}
         return {"output": result.get("output", "已打开。"), "is_error": False}
 
-    # ══════════ 凭证自动配置（v0.3.2） ══════════
+    # ══════════ 凭证配置（v0.4.1：仅手动粘贴，不探测浏览器） ══════════
 
     @llm_tool(
         name="steam_credentials",
         description=(
             "配置 Steam 扩展能力所需凭证（STEAM_API_KEY 与 steam_cookie.txt）。何时用：用户问'配置 Steam/"
-            "给 Steam 配 API Key/好友功能用不了/回复好友用不了/自动配置一下'或插件提示缺少凭证时。"
+            "给 Steam 配 API Key/好友功能用不了/回复好友用不了/配置一下'或插件提示缺少凭证时。"
             "三种模式（mode）：skip=不配置（保留本地库/查价/促销能力，好友/发消息不可用）；"
-            "yui=拿到凭证由 YUI 配置：把 API Key 传 api_key、cookie 传 cookie 参数，写入插件目录并立即验证；"
-            "auto=全自动：有凭证同样写入验证；没有任何凭证时先自动探测本机 Chrome/Edge 里的 steamcommunity 登录 Cookie"
-            "（找到即写入并验证），探测不到再打开官方获取页并给出指引（验证由助手协助）。验证通过才报告配置成功；"
-            "验证失败必须如实说明原因，不得声称配置完成。"
-            "安全：Key/Cookie 只写入本地插件目录并验证有效性，不回显内容。"
+            "yui=拿到凭证由 YUI 配置：把 API Key 传 api_key、cookie 传 cookie 参数，加密写入用户数据目录并立即验证；"
+            "auto=有凭证同样写入验证；没有任何凭证时打开官方获取页，并说明需要用户手动粘贴 Key/Cookie。"
+            "本工具不会读取或解密浏览器 Cookie；验证通过才报告配置成功，验证失败必须如实说明原因。"
+            "安全：Key/Cookie 用 Windows DPAPI 加密保存在 %LOCALAPPDATA%\\N.E.K.O\\steam_manager，不回显内容。"
         ),
         parameters={
             "type": "object",
@@ -569,7 +614,7 @@ class SteamManagerPlugin(NekoPluginBase):
         mode = (mode or params.get("mode") or "auto").strip().lower()
         api_key = (api_key or params.get("api_key") or "").strip()
         cookie = (cookie or params.get("cookie") or "").strip()
-        status = steam.credentials_status()
+        status = await asyncio.to_thread(steam.credentials_status)
         if mode == "skip":
             return {
                 "output": "已选择不配置 Steam 凭证。本地游戏库/启动游戏/查价格/看促销功能不受影响；"
@@ -581,18 +626,18 @@ class SteamManagerPlugin(NekoPluginBase):
         problems: list[str] = []
         if api_key:
             try:
-                steam.save_api_key(api_key)
-                ok, msg = steam.validate_api_key(api_key)
-                saved.append(f"API Key：{'已写入并验证通过' if ok else f'已写入但验证未通过（{msg}）'}")
+                await asyncio.to_thread(steam.save_api_key, api_key)
+                ok, msg = await asyncio.to_thread(steam.validate_api_key, api_key)
+                saved.append(f"API Key：{'已加密写入并验证通过' if ok else f'已加密写入但验证未通过（{msg}）'}")
                 if not ok:
                     problems.append(msg)
             except ValueError as exc:
                 problems.append(str(exc))
         if cookie:
             try:
-                steam.save_community_cookie(cookie)
-                ok, msg = steam.validate_community_cookie(cookie)
-                saved.append(f"Cookie：{'已写入并验证通过' if ok else f'已写入但验证未通过（{msg}）'}")
+                await asyncio.to_thread(steam.save_community_cookie, cookie)
+                ok, msg = await asyncio.to_thread(steam.validate_community_cookie, cookie)
+                saved.append(f"Cookie：{'已加密写入并验证通过' if ok else f'已加密写入但验证未通过（{msg}）'}")
                 if not ok:
                     problems.append(msg)
             except ValueError as exc:
@@ -600,63 +645,29 @@ class SteamManagerPlugin(NekoPluginBase):
         if not api_key and not cookie:
             if mode == "yui":
                 return {
-                    "output": "未收到凭证（mode=yui 需要你提供 api_key 或 cookie 参数）。可调用 auto 模式自动探测或打开获取页。",
+                    "output": "未收到凭证（mode=yui 需要你提供 api_key 或 cookie 参数）。",
                     "is_error": True,
                     "error": "NO_CREDENTIAL",
                 }
-            # auto：先自动探测浏览器里的 steamcommunity 登录 cookie
-            probe = steam.probe_browser_cookies()
-            if probe["found"]:
-                try:
-                    steam.save_community_cookie(
-                        "sessionid=" + probe["sessionid"] + "; steamLoginSecure=" + probe["steam_login_secure"]
-                        if probe["steam_login_secure"]
-                        else "sessionid=" + probe["sessionid"] + "; steamLogin=" + probe["steam_login"]
-                    )
-                    ok, msg = steam.validate_community_cookie(
-                        "sessionid=" + probe["sessionid"] + "; steamLoginSecure=" + probe["steam_login_secure"]
-                        if probe["steam_login_secure"]
-                        else "sessionid=" + probe["sessionid"] + "; steamLogin=" + probe["steam_login"]
-                    )
-                    if ok:
-                        return {
-                            "output": "已从浏览器自动检测到 Steam 登录 Cookie（来源：" + probe["browser"] + "）并写入验证通过：" + msg + "\n" + _cred_status_line(steam.credentials_status()),
-                            "is_error": False,
-                            "result": {"mode": "auto", "source": "browser_probe", **steam.credentials_status()},
-                        }
-                    return {
-                        "output": "检测到 Cookie 但验证未通过（" + msg + "），未写入。可重新在浏览器登录后重试。",
-                        "is_error": True,
-                        "error": "CREDENTIAL_INVALID",
-                        "result": {"mode": "auto", "source": "browser_probe", **steam.credentials_status()},
-                    }
-                except ValueError as exc:
-                    return {
-                        "output": "检测到 Cookie 但写入失败：" + str(exc),
-                        "is_error": True,
-                        "error": "CREDENTIAL_INVALID",
-                        "result": {"mode": "auto", **steam.credentials_status()},
-                    }
-            # 探测不到：打开官方获取页 + 指引
+            # auto：绝不自动读取/解密浏览器 Cookie；只打开官方获取页并说明手动粘贴
             try:
-                webbrowser.open("https://steamcommunity.com/dev/apikey")
+                await asyncio.to_thread(webbrowser.open, "https://steamcommunity.com/dev/apikey")
                 opened = "已为你打开 Steam API Key 获取页（https://steamcommunity.com/dev/apikey）。\n"
             except OSError:
                 opened = "请打开 https://steamcommunity.com/dev/apikey 获取 API Key。\n"
-            probe_note = f"浏览器 Cookie 自动探测未找到登录态（{probe.get('error') or '浏览器库中无 steamcommunity cookie'}）。\n" if not probe["found"] else ""
             return {
                 "output": (
                     opened
-                    + probe_note
                     + "步骤：1) 在页面登录你的 Steam 账号，域名填 localhost 即可点创建；"
-                    "2) 把生成的 Key 复制给我（说'配置 Steam，Key 是……'），我会写入并验证；"
-                    "3) 回复好友还需 steamcommunity 登录态：登录 steamcommunity.com 后重新调用本工具（auto 会再次自动探测 Cookie）。"
+                    "2) 把生成的 Key 复制给我（说'配置 Steam，Key 是……'），我会加密写入并验证；"
+                    "3) 回复好友还需 steamcommunity 登录 Cookie：请在浏览器登录 steamcommunity.com，"
+                    "手动导出含 sessionid 的 Cookie 后发给我；本插件不会自动探测浏览器 Cookie。"
                     + _cred_status_line(status)
                 ),
                 "is_error": False,
-                "result": {"mode": "auto", **status},
+                "result": {"mode": "auto", "source": "manual", **status},
             }
-        new_status = steam.credentials_status()
+        new_status = await asyncio.to_thread(steam.credentials_status)
         summary = "\n".join(saved) if saved else "本次未写入任何凭证。"
         if problems:
             return {
@@ -687,60 +698,62 @@ class SteamManagerPlugin(NekoPluginBase):
         _y = self._civ6_ops_yield()
         if _y:
             return _y
-        import logging
-
-        _log = logging.getLogger("N.E.K.O.Plugin_steam_manager")
-        info = control.get_foreground_window_info()
-        civ = control.find_civ6_window()
-        _log.info("game_capture: fg=%r civ6_window=%r",
-                  info and info.get("title"), civ and civ.get("title"))
-        # 增强（v0.3.4）：前台窗口不是文明6 但文明6 窗口存在时，改用 PrintWindow
+        hint = (self._game_window_title or "").strip()
+        info = await asyncio.to_thread(control.get_foreground_window_info)
+        civ = None
+        if hint:
+            civ = await asyncio.to_thread(control.find_window_by_title, hint)
+        _logger.info("game_capture: fg=%r target_window=%r",
+                     info and info.get("title"), civ and civ.get("title"))
+        # 增强（v0.3.4）：前台窗口不是目标游戏但目标窗口存在时，改用 PrintWindow
         # 直抓游戏窗口本体——前台被聊天/终端窗口遮挡时，屏幕区域截图只会截到遮挡层，
         # PrintWindow 向游戏窗口请求绘制，拿到的永远是游戏画面。
-        fg_is_civ = info is not None and "civilization vi" in (info.get("title") or "").casefold()
-        if civ is not None and not fg_is_civ:
-            path = control.capture_window_printwindow(civ)
-            _log.info("game_capture: printwindow=%s", bool(path))
+        fg_is_target = info is not None and hint.casefold() in (info.get("title") or "").casefold()
+        if civ is not None and not fg_is_target:
+            path = await asyncio.to_thread(control.capture_window_printwindow, civ)
+            _logger.info("game_capture: printwindow=%s", bool(path))
             if path:
                 self._state.note_frame(civ, path)
                 self._state.note_event("capture", f"{civ['title']} / {civ['process']} (printwindow)")
                 width = civ["rect"][2] - civ["rect"][0]
                 height = civ["rect"][3] - civ["rect"][1]
-                view_path = _to_png(path)
+                view_path = await asyncio.to_thread(_to_png, path)
+                images = await asyncio.to_thread(_image_entry, view_path) or []
                 fmt_note = "（PNG，视觉可直接读取）" if view_path.endswith(".png") else "（BMP，视觉可能读不出，请让 YUI 改用 civ6_ops_peek）"
                 return {
                     "output": (
-                        f"已截取文明6 游戏窗口画面（PrintWindow 直抓，被聊天/终端窗口遮挡也能拿到游戏本体）：\n"
+                        f"已截取目标游戏窗口画面（PrintWindow 直抓，被聊天/终端窗口遮挡也能拿到游戏本体）：\n"
                         f"窗口：{civ['title']}（进程 {civ['process']}，PID {civ['pid']}）\n"
                         f"尺寸：{width}×{height}\n截图路径：{view_path}{fmt_note}\n时间：{civ['ts']:.0f}"
                     ),
                     "is_error": False,
                     "screenshot": view_path,
-                    "images": _image_entry(view_path) or [],
+                    "images": images,
                 }
             # PrintWindow 直抓失败（运行环境限制）：如实说明并引导改用 civ6_buddy 的 peek
             return {
                 "output": (
-                    f"检测到文明6 窗口存在（{civ['title']}）但 PrintWindow 直抓失败"
+                    f"检测到目标游戏窗口存在（{civ['title']}）但 PrintWindow 直抓失败"
                     f"（进程环境限制，前台被遮挡时本工具截不到游戏本体）。\n"
-                    f"请改用 civ6_buddy 插件的 civ6_ops_peek 工具确认文明6 画面——"
+                    f"请改用 civ6_buddy 插件的 civ6_ops_peek 工具确认画面——"
                     f"它会用同一条 PrintWindow 通道直抓游戏本体（被遮挡也能拿到），"
                     f"或让玩家把游戏切到前台后我再截一次。"
                 ),
                 "is_error": True,
                 "error": "PRINTWINDOW_FAIL",
             }
-        _log.info("game_capture: branch=bitblt fg=%r", info and info.get("title"))
+        _logger.info("game_capture: branch=bitblt fg=%r", info and info.get("title"))
         if not info:
             return {"output": "没有检测到前台窗口（可能窗口已最小化）。请确认游戏窗口在前台。", "is_error": True, "error": "NO_WINDOW"}
-        path = control.capture_window_bmp(info)
+        path = await asyncio.to_thread(control.capture_window_bmp, info)
         if not path:
             return {"output": "截图失败：无法读取屏幕区域。", "is_error": True, "error": "CAPTURE_FAILED"}
         self._state.note_frame(info, path)
         self._state.note_event("capture", f"{info['title']} / {info['process']}")
         width = info["rect"][2] - info["rect"][0]
         height = info["rect"][3] - info["rect"][1]
-        view_path = _to_png(path)
+        view_path = await asyncio.to_thread(_to_png, path)
+        images = await asyncio.to_thread(_image_entry, view_path) or []
         fmt_note = "（PNG，视觉可直接读取）" if view_path.endswith(".png") else "（BMP，视觉可能读不出，请让 YUI 改用 civ6_ops_peek）"
         return {
             "output": (
@@ -749,7 +762,7 @@ class SteamManagerPlugin(NekoPluginBase):
             ),
             "is_error": False,
             "screenshot": view_path,
-            "images": _image_entry(view_path) or [],
+            "images": images,
         }
 
     @llm_tool(
@@ -780,12 +793,12 @@ class SteamManagerPlugin(NekoPluginBase):
             interval = 3
         if on:
             # v0.3.1 修复：重复开启时先停旧 watcher，避免多线程并存疯狂截图
-            self._watcher.stop()
+            await asyncio.to_thread(self._watcher.stop)
             self._watcher = control.FrameWatcher(self._state, interval=interval)
             self._watcher.start()
             self._state.enable_watch()
             return {"output": f"后台画面监控已开启（每 {max(1, interval)} 秒截一帧）。用 game_state_summary 查看进展，用 watch_game(on=false) 关闭。", "is_error": False}
-        self._watcher.stop()
+        await asyncio.to_thread(self._watcher.stop)
         self._state.disable_watch()
         return {"output": "后台画面监控已关闭。", "is_error": False}
 
@@ -862,7 +875,7 @@ class SteamManagerPlugin(NekoPluginBase):
             "在已授权的游戏窗口上执行一次键鼠动作。何时用：YUI 已获得接管授权（take_control on）后，"
             "需要点击画面或按键操作游戏时。"
             "参数 action：click（点击，需 x/y，窗口内相对坐标 0-1000）、key（按键，key 为单字母或 1-255 的虚拟键码）、"
-            "text（输入文本，text 为 ASCII 内容）；x/y：点击坐标（窗口相对千分比）。"
+            "text（输入文本，text 支持 Unicode（含中文、大写与符号））；x/y：点击坐标（窗口相对千分比）。"
             "安全：仅当接管开启且窗口仍在场时可用；每次动作都会记录到行为时间线。"
         ),
         parameters={
@@ -872,7 +885,7 @@ class SteamManagerPlugin(NekoPluginBase):
                 "x": {"type": "integer", "description": "click 的窗口相对 X（0-1000）"},
                 "y": {"type": "integer", "description": "click 的窗口相对 Y（0-1000）"},
                 "key": {"type": "string", "description": "key 的单字母或虚拟键码（1-255）"},
-                "text": {"type": "string", "description": "text 的 ASCII 内容"},
+                "text": {"type": "string", "description": "text 的内容（支持 Unicode）"},
             },
             "required": ["action"],
         },
@@ -900,20 +913,20 @@ class SteamManagerPlugin(NekoPluginBase):
             return {"output": "缺少窗口信息，无法执行操作。请先 game_capture。", "is_error": True, "error": "NO_WINDOW"}
         if action == "click":
             sx, sy = control.window_client_to_screen(win, max(0, min(1000, x)), max(0, min(1000, y)))
-            control.mouse_click_abs(sx, sy)
+            await asyncio.to_thread(control.mouse_click_abs, sx, sy)
             self._state.note_event("action", f"click ({x},{y}) → 屏幕 ({sx},{sy}) @ {win.get('title', '')}")
             return {"output": f"已点击窗口内 ({x},{y})（屏幕 {sx},{sy}）。", "is_error": False}
         if action == "key":
             vk = _parse_vk(key)
             if vk is None:
                 return {"output": "key 参数无效：请输入单字母（如 'a'）或 1-255 的虚拟键码。", "is_error": True, "error": "BAD_KEY"}
-            control.press_key(vk)
+            await asyncio.to_thread(control.press_key, vk)
             self._state.note_event("action", f"key {key}")
             return {"output": f"已按键：{key}。", "is_error": False}
         if action == "text":
             if len(text) > 100:
                 return {"output": "文本过长（上限 100 字符）。", "is_error": True, "error": "TEXT_TOO_LONG"}
-            control.type_text(text)
+            await asyncio.to_thread(control.type_text, text)
             self._state.note_event("action", f"text {text}")
             return {"output": f"已输入文本：{text}。", "is_error": False}
         return {"output": "action 无效：可选 click / key / text。", "is_error": True, "error": "BAD_ACTION"}

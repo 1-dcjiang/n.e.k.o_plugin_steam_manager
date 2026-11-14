@@ -127,7 +127,7 @@ def test_credentials_skip_mode() -> None:
 
 
 def test_credentials_yui_writes_and_verifies(monkeypatch, tmp_path) -> None:
-    """yui：提供 API Key → 写入插件目录并验证；验证失败如实报错。"""
+    """yui：提供 API Key → 加密写入并验证；验证失败如实报错。"""
     from plugin.plugins.steam_manager import steam
 
     written: list[str] = []
@@ -143,7 +143,7 @@ def test_credentials_yui_writes_and_verifies(monkeypatch, tmp_path) -> None:
 
 
 def test_credentials_auto_without_credential_opens_guide(monkeypatch) -> None:
-    """auto 且无凭证：打开官方获取页并给指引，不报错。"""
+    """auto 且无凭证：打开官方获取页并给手动粘贴指引，绝不探测浏览器 Cookie。"""
     import plugin.plugins.steam_manager as pkg
     from plugin.plugins.steam_manager import steam
 
@@ -156,6 +156,9 @@ def test_credentials_auto_without_credential_opens_guide(monkeypatch) -> None:
     assert len(opened) == 1
     assert "steamcommunity.com/dev/apikey" in opened[0]
     assert "API Key" in result["output"]
+    assert "不会自动探测浏览器 Cookie" in result["output"]
+    assert result["result"]["source"] == "manual"
+    assert not hasattr(steam, "probe_browser_cookies")
 
 
 def test_entry_run_setup_routes(monkeypatch) -> None:
@@ -167,3 +170,37 @@ def test_entry_run_setup_routes(monkeypatch) -> None:
     result = _run(inst.entry_run(action="setup", mode="skip", parameters={}))
     assert result["is_error"] is False
     assert "不配置" in result["output"]
+
+
+def test_game_capture_uses_configured_window_title(monkeypatch, tmp_path) -> None:
+    """game_capture 使用配置的窗口标题，不再硬编码 Civilization VI。"""
+    import time
+
+    import plugin.plugins.steam_manager as pkg
+    from plugin.plugins.steam_manager import control
+
+    inst = _plugin()
+    inst._game_window_title = "factorio"
+    inst._state = control.ControlState()
+    inst._civ6_ops_yield = lambda: None
+    hints: list[str] = []
+
+    monkeypatch.setattr(control, "get_foreground_window_info", lambda: {
+        "title": "Windows Terminal", "process": "wt.exe", "pid": 1,
+        "rect": (0, 0, 100, 100), "ts": time.time(),
+    })
+    monkeypatch.setattr(control, "find_window_by_title", lambda hint: hints.append(hint) or {
+        "title": "Factorio 1.1", "process": "factorio.exe", "pid": 2,
+        "rect": (0, 0, 200, 100), "ts": time.time(),
+    })
+    frame = tmp_path / "frame.bmp"
+    frame.write_bytes(b"BM")
+    monkeypatch.setattr(control, "capture_window_printwindow", lambda info: str(frame))
+    monkeypatch.setattr(pkg, "_to_png", lambda p: p)
+    monkeypatch.setattr(pkg, "_image_entry", lambda p: [{"data_b64": "eA==", "mime": "image/png"}])
+
+    result = _run(inst.game_capture())
+    assert result["is_error"] is False
+    assert hints == ["factorio"]
+    assert "Factorio 1.1" in result["output"]
+    assert result["images"]

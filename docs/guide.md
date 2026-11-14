@@ -37,9 +37,10 @@ v0.3.0 起同时充当 **Steam 账号/商店助手**：账户信息、好友列�
 ## 可选凭证配置
 
 - **STEAM_API_KEY**（账户信息增强 / 好友列表 / 回复好友时按昵称解析）：环境变量 `STEAM_API_KEY`，
-  或把 Key 写入插件目录 `steam_api_key.txt`（明文，仅本地读取）。
-- **steam_cookie.txt**（回复好友必需）：登录 `https://steamcommunity.com/` 后，把浏览器 Cookie 字符串
-  写入插件目录 `steam_cookie.txt`（需含 `sessionid` 与 `steamLoginSecure`/`steamLogin`）。
+  或调用 `steam_credentials` 手动粘贴 Key。凭证以 Windows DPAPI 加密保存在
+  `%LOCALAPPDATA%\N.E.K.O\steam_manager`，不会写入插件源码目录。
+- **steamcommunity Cookie**（回复好友必需）：登录 `https://steamcommunity.com/` 后，把含 `sessionid`
+  与 `steamLoginSecure`/`steamLogin` 的 Cookie 字符串手动发给 YUI 配置。插件**不会**自动读取或解密浏览器 Cookie。
 
 ## 游戏助手使用流程（示例）
 
@@ -57,8 +58,10 @@ v0.3.0 起同时充当 **Steam 账号/商店助手**：账户信息、好友列�
 
 - Steam 侧：只读取本地库元数据与账号昵称；启动/打开游戏必须来自用户明确指令
 - 凭证：API Key / cookie 只读取不输出到对话；回复好友仅在用户明确要求时发送
-- 监控：后台截帧**默认关闭**，用户要求跟踪时才开启（间隔最小 1 秒，仅保留最近 20 帧，自动清理）
+- 监控：后台截帧**默认关闭**，用户要求跟踪时才开启（间隔最小 1 秒，仅保留最近 40 个帧文件，自动清理 PNG/BMP）
 - 接管：键鼠模拟**默认关闭**；开启前提是有最近的窗口画面；仅作用于当前前台游戏窗口；每次动作都记录进时间线；用户可随时要求交还
+- 游戏窗口：默认匹配标题含 `civilization vi`，可用 `steam.game_window_title` 改为其他游戏
+- 不自动探测浏览器 Cookie；凭证只能手动粘贴配置，并以 DPAPI 加密保存
 - 不读取密码、令牌、云存档、聊天记录等敏感数据；不修改 Steam 配置
 
 ## 安装路径识别
@@ -68,6 +71,6 @@ v0.3.0 起同时充当 **Steam 账号/商店助手**：账户信息、好友列�
 
 ## 实现说明
 
-- 全部使用 Python 标准库 + ctypes（GDI 截屏存 BMP、SendInput/mouse_event/keybd_event 模拟输入），无第三方依赖
+- 全部使用 Python 标准库 + ctypes（GDI 截屏存 PNG，失败回退 BMP；SendInput 发送 Unicode 文本），无第三方依赖
 - 截图文件保存于 `%TEMP%\steam_manager\frames\`，随监控滚动清理
 - 非 Windows 环境：相关工具返回明确提示，不报错崩溃

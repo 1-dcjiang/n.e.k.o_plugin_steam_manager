@@ -2,6 +2,7 @@
 
 让 YUI 管理本地 Steam 客户端与游戏库的 N.E.K.O 插件（Windows），并充当**游戏助手**：读取所玩游戏画面、实时跟踪行为、提供建议，玩家可授权 YUI 接管键鼠代打。
 v0.3.0 起新增 **Steam 账号/商店助手**：账户信息、好友列表、回复好友、查价格、查促销、打开任意游戏。
+v0.4.1 起凭证改为 DPAPI 加密存储、不再自动探测浏览器 Cookie，并补齐重试、部分失败提示与 Unicode 输入。
 
 ## 功能
 
@@ -39,8 +40,9 @@ v0.3.0 起新增 **Steam 账号/商店助手**：账户信息、好友列表、�
 1. 打开 N.E.K.O 客户端 → 插件中心
 2. 搜索「Steam管理」，点击安装
 3. 本机需已安装 Steam 客户端（常见路径 `C:\Program Files (x86)\Steam`）
-4. （可选）账户/好友/回复功能：配置 `STEAM_API_KEY`（环境变量或插件目录 `steam_api_key.txt`）；
-   回复好友还需 `steam_cookie.txt`（steamcommunity 登录 Cookie，含 `sessionid`）
+4. （可选）账户/好友/回复功能：配置 `STEAM_API_KEY`（环境变量优先），或调用 `steam_credentials`
+   手动粘贴 API Key / Cookie；凭证用 Windows DPAPI 加密保存在
+   `%LOCALAPPDATA%\N.E.K.O\steam_manager`，不会写进插件源码目录，也不会自动读取浏览器 Cookie
 
 ## 游戏助手用法
 
@@ -59,9 +61,10 @@ v0.3.0 起新增 **Steam 账号/商店助手**：账户信息、好友列表、�
 
 ## 安全说明
 
-- 后台监控默认关闭，用户要求才开启；仅保留最近 20 帧自动清理
-- 键鼠接管默认关闭，必须玩家显式授权；仅作用于前台游戏窗口；每步操作记入时间线
-- 只读取本地库元数据与屏幕画面；API Key / cookie 只读取不输出；不读取密码、令牌、云存档、聊天记录
+- 后台监控默认关闭，用户要求才开启；仅保留最近 40 个帧文件（PNG/BMP 混合）自动清理
+- 键鼠接管默认关闭，必须玩家显式授权；仅作用于当前前台游戏窗口；每步操作记入时间线
+- 只读取本地库元数据与屏幕画面；API Key / cookie 用 DPAPI 加密保存、日志与会话输出经过脱敏
+- 不自动探测浏览器 Cookie；凭证只能由用户手动粘贴配置
 - 回复好友属于对外写操作，仅在用户明确要求时发送
 - 不修改任何 Steam 配置；全部标准库 + ctypes 实现，无第三方依赖
 
@@ -70,11 +73,22 @@ v0.3.0 起新增 **Steam 账号/商店助手**：账户信息、好友列表、�
 1. 注册表 `HKCU\Software\Valve\Steam` → `SteamPath`
 2. 兜底：`C:\Program Files (x86)\Steam`、`C:\Program Files\Steam`
 
+## 配置
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `steam.game_window_title` | `civilization vi` | 游戏助手优先查找的窗口标题片段（不区分大小写），其他游戏可改此项 |
+| `STEAM_MANAGER_DATA_DIR` | `%LOCALAPPDATA%\N.E.K.O\steam_manager` | 凭证加密存储目录覆盖 |
+| `STEAM_API_KEY` | 无 | 环境变量优先于本地配置文件 |
+
 ## 开发与构建
 
 ```bash
-# 测试
+# 测试（插件已挂载进 N.E.K.O 时）
 python -m pytest plugin/plugins/steam_manager/tests/ -q
+# 本地克隆（目录名不是 steam_manager）
+set NEKO_SOURCE_ROOT=C:\path\to\N.E.K.O
+python -m pytest tests -q
 # 发布前检查
 python -m plugin.neko_plugin_cli.cli check -r steam_manager
 ```

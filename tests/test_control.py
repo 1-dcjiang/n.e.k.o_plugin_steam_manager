@@ -134,7 +134,7 @@ def test_window_client_to_screen() -> None:
     sx, sy = window_client_to_screen(win, 0, 0)
     assert (sx, sy) == (100, 100)
     sx, sy = window_client_to_screen(win, 1000, 1000)
-    assert (sx, sy) == (500, 400)
+    assert (sx, sy) == (499, 399)  # right/bottom 是排他边界，不能落在窗口外
 
 
 # ══════════ BMP 写入（字节校验） ══════════
@@ -162,16 +162,79 @@ def test_write_bmp_header_and_size(tmp_path) -> None:
 
 
 def test_cleanup_old_frames_keeps_recent(tmp_path, monkeypatch) -> None:
-    """FrameWatcher 定期清理：只保留最近 keep 个帧文件，防止磁盘膨胀。"""
+    """FrameWatcher 定期清理：PNG/BMP 混合目录只保留最近 keep 个帧文件。"""
+    import os
+
     from plugin.plugins.steam_manager import control
 
     frame_dir = tmp_path / "frames"
     frame_dir.mkdir()
+    names = []
     for i in range(1, 11):
-        (frame_dir / f"frame_{i:04d}.bmp").write_bytes(b"\x00" * 10)
+        name = f"frame_{i:04d}.png" if i % 2 == 0 else f"frame_{i:04d}.bmp"
+        path = frame_dir / name
+        path.write_bytes(b"\x00" * 10)
+        os.utime(path, (1000 + i, 1000 + i))
+        names.append(name)
     monkeypatch.setattr(control, "_FRAME_DIR", str(frame_dir))
     state = control.ControlState()
     watcher = control.FrameWatcher(state, interval=9.0)
     watcher._cleanup_old_frames(keep=3)
     remaining = sorted(f.name for f in frame_dir.iterdir())
-    assert remaining == ["frame_0008.bmp", "frame_0009.bmp", "frame_0010.bmp"]
+    assert remaining == sorted(names[-3:])
+
+
+# ══════════ v0.4.1：Unicode 输入 / 鼠标边界 / 通用窗口 ══════════
+
+
+def test_unicode_units_supports_chinese_and_symbols() -> None:
+    from plugin.plugins.steam_manager.control import _unicode_units
+
+    assert _unicode_units("A!") == [ord("A"), ord("!")]
+    assert _unicode_units("中") == [0x4E2D]
+    assert len(_unicode_units("😀")) == 2  # 代理对
+
+
+def test_type_text_uses_sendinput_unicode(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import control
+
+    captured: list[list[tuple[int, int]]] = []
+
+    class _FakeUser32:
+        def SendInput(self, count, events, size):
+            captured.append([(events[i].ki.wScan, events[i].ki.dwFlags) for i in range(count)])
+            return count
+
+    monkeypatch.setattr(control, "USER32", _FakeUser32())
+    assert control.type_text("A中") == 2
+    events = captured[0]
+    assert len(events) == 4
+    assert events[0] == (ord("A"), control._KEYEVENTF_UNICODE)
+    assert events[1][1] == control._KEYEVENTF_UNICODE | control._KEYEVENTF_KEYUP
+    assert events[2][0] == 0x4E2D
+
+
+def test_mouse_click_abs_clamps_to_screen(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import control
+
+    captured: list[tuple[int, int]] = []
+
+    class _FakeUser32:
+        def mouse_event(self, flags, dx, dy, data, extra):
+            if flags & control._MOUSEEVENTF_MOVE:
+                captured.append((dx, dy))
+
+    monkeypatch.setattr(control, "USER32", _FakeUser32())
+    monkeypatch.setattr(control, "_screen_size", lambda: (1920, 1080))
+    control.mouse_click_abs(-50, 2000)
+    assert captured == [(0, 65535)]
+    control.mouse_click_abs(5000, -10)
+    assert captured[-1] == (65535, 0)
+
+
+def test_find_window_by_title_empty_without_user32(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import control
+
+    monkeypatch.setattr(control, "USER32", None)
+    assert control.find_window_by_title("civilization vi") is None
+    assert control.find_window_by_title("") is None

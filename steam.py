@@ -6,28 +6,36 @@
 - 通过 steam.exe -applaunch 启动已安装游戏
 - 读取本地最近登录账号元数据（config/loginusers.vdf，仅昵称/SteamID）
 - 经 Steam Web API 查询账户信息、好友列表（需 STEAM_API_KEY）
-- 经 steamcommunity 网页聊天接口回复好友（需 steam_cookie.txt）
+- 经 steamcommunity 网页聊天接口回复好友（需加密保存的 steamcommunity Cookie）
 - 经 Steam Store 公开 API 查询游戏价格与促销（无需凭证）
 - 打开任意 Steam 应用：已安装直接启动，未安装打开商店页
 
 安全边界：只读本地库元数据 + 按用户明确指令启动游戏；
-账号/好友/发消息仅在使用户授权的场景执行，凭据（API Key / cookie）
-只读取不输出；不读取密码、令牌、云存档等敏感数据。
+账号/好友/发消息仅在用户授权的场景执行，凭据（API Key / cookie）
+以 DPAPI 加密保存在用户数据目录、只读不输出；不自动探测浏览器 Cookie，
+不读取密码、令牌、云存档等敏感数据。
 """
 
 from __future__ import annotations
 
 import base64
+import email.utils
 import json
+import logging
 import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+_logger = logging.getLogger("N.E.K.O.Plugin_steam_manager.steam")
+
+_CREDENTIAL_MARKER = "NEKO_DPAPI_V1\n"
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 
@@ -266,14 +274,21 @@ def launch_game(steam_path: str, app_id: str) -> dict:
     返回 {"ok": bool, ...} 信封；steam.exe 不存在时给出明确错误。
     """
     app_id = (app_id or "").strip()
-    if not app_id.isdigit():
-        return {"ok": False, "error": "INVALID_APP_ID", "output": "AppID 必须是数字。"}
-    exe = os.path.join(steam_path, "steam.exe")
-    if not os.path.isfile(exe):
+    if not app_id.isdigit() or len(app_id) > 10:
+        return {"ok": False, "error": "INVALID_APP_ID", "output": "AppID 必须是 1-10 位数字。"}
+    if not steam_path or not os.path.isabs(steam_path):
+        return {"ok": False, "error": "STEAM_NOT_FOUND", "output": "Steam 路径无效，无法启动游戏。"}
+    base = os.path.realpath(steam_path)
+    exe = os.path.realpath(os.path.join(base, "steam.exe"))
+    try:
+        inside = os.path.commonpath([base, exe]) == base
+    except ValueError:
+        inside = False
+    if not inside or os.path.basename(exe).lower() != "steam.exe" or not os.path.isfile(exe):
         return {
             "ok": False,
             "error": "STEAM_EXE_NOT_FOUND",
-            "output": f"在 {steam_path} 下未找到 steam.exe，无法启动游戏。",
+            "output": f"在 {steam_path} 下未找到有效的 steam.exe，无法启动游戏。",
         }
     try:
         subprocess.Popen(
@@ -288,35 +303,182 @@ def launch_game(steam_path: str, app_id: str) -> dict:
         return {"ok": False, "error": "LAUNCH_FAILED", "output": f"启动游戏失败：{exc}"}
 
 
-# ══════════ 可选凭证（只读，不输出内容） ══════════
+# ══════════ 可选凭证（DPAPI 加密，只读不输出） ══════════
+
+
+def _data_dir() -> str:
+    """凭证/运行数据目录：%LOCALAPPDATA%\\N.E.K.O\\steam_manager（非 Windows 用 XDG 路径）。"""
+    override = os.environ.get("STEAM_MANAGER_DATA_DIR", "").strip()
+    if override:
+        return override
+    root = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
+    if not root:
+        root = os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(root, "N.E.K.O", "steam_manager")
+
+
+def _credential_path(name: str) -> str:
+    return os.path.join(_data_dir(), name)
+
+
+def _legacy_credential_path(name: str) -> str:
+    """旧版把凭证明文写在插件源码目录；仅用于一次性迁移读取。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+
+def _dpapi_available() -> bool:
+    return os.name == "nt"
+
+
+def _dpapi_protect(data: bytes) -> bytes:
+    """当前 Windows 用户 DPAPI 加密（CryptProtectData）。"""
+    if not _dpapi_available():
+        raise OSError("DPAPI 仅支持 Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    class _DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(_DATA_BLOB), wintypes.LPCWSTR, ctypes.POINTER(_DATA_BLOB),
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_DATA_BLOB),
+    ]
+    crypt32.CryptProtectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    buf_in = ctypes.create_string_buffer(data)
+    blob_in = _DATA_BLOB(len(data), ctypes.cast(buf_in, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DATA_BLOB()
+    if not crypt32.CryptProtectData(
+        ctypes.byref(blob_in),
+        "N.E.K.O steam_manager",
+        None,
+        None,
+        None,
+        0x1,  # CRYPTPROTECT_UI_FORBIDDEN
+        ctypes.byref(blob_out),
+    ):
+        raise OSError(ctypes.get_last_error(), "DPAPI 加密失败（CryptProtectData）")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def _dpapi_unprotect(data: bytes) -> bytes:
+    """当前 Windows 用户 DPAPI 解密（CryptUnprotectData）。"""
+    if not _dpapi_available():
+        raise OSError("DPAPI 仅支持 Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    class _DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(_DATA_BLOB), ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(_DATA_BLOB),
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_DATA_BLOB),
+    ]
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    buf_in = ctypes.create_string_buffer(data)
+    blob_in = _DATA_BLOB(len(data), ctypes.cast(buf_in, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DATA_BLOB()
+    if not crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0x1, ctypes.byref(blob_out)
+    ):
+        raise OSError(ctypes.get_last_error(), "DPAPI 解密失败（CryptUnprotectData）")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def _read_secret_file(path: str) -> str:
+    """读取凭证文件；DPAPI 密文自动解密，兼容旧版明文。"""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return ""
+    text = raw.decode("utf-8", errors="replace")
+    marker = _CREDENTIAL_MARKER.strip()
+    if text.startswith(marker):
+        try:
+            payload = text[len(marker):].lstrip("\r\n").strip()
+            cipher = base64.b64decode(payload)
+            return _dpapi_unprotect(cipher).decode("utf-8", errors="replace").strip()
+        except (OSError, ValueError) as exc:
+            _logger.warning("credential decrypt failed at %s: %s", path, exc)
+            return ""
+    return text.strip()
+
+
+def _write_secret_file(path: str, value: str) -> None:
+    """把凭证以 DPAPI 密文写入用户数据目录（非 Windows 退回明文，权限 0600）。
+
+    先写同目录临时文件再 os.replace，避免读写竞态留下半截凭证。
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    if _dpapi_available():
+        cipher = _dpapi_protect(value.encode("utf-8"))
+        payload = _CREDENTIAL_MARKER + base64.b64encode(cipher).decode("ascii")
+    else:
+        payload = value
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(payload)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def _read_credential(name: str) -> str:
+    """读用户目录凭证；旧版插件目录明文会自动迁移到加密存储后删除。"""
+    primary = _credential_path(name)
+    value = _read_secret_file(primary)
+    if value:
+        return value
+    legacy = _legacy_credential_path(name)
+    value = _read_secret_file(legacy)
+    if not value:
+        return ""
+    try:
+        _write_secret_file(primary, value)
+        os.remove(legacy)
+        _logger.info("migrated legacy plaintext credential %s to %s", name, primary)
+    except OSError as exc:
+        _logger.warning("credential migration failed for %s: %s", name, exc)
+    return value
 
 
 def api_key() -> str:
-    """读取 Steam Web API Key：环境变量 STEAM_API_KEY 或插件目录 steam_api_key.txt。"""
+    """读取 Steam Web API Key：环境变量 STEAM_API_KEY 或用户数据目录加密文件。"""
     key = os.environ.get("STEAM_API_KEY", "").strip()
     if key:
         return key
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(here, "steam_api_key.txt"), encoding="utf-8") as fh:
-            return fh.read().strip()
-    except OSError:
-        return ""
+    return _read_credential("steam_api_key.txt")
 
 
 def community_cookie() -> str:
-    """读取 steamcommunity 登录 cookie：环境变量 STEAM_COOKIE 或插件目录 steam_cookie.txt。
+    """读取 steamcommunity 登录 cookie：用户数据目录加密文件或环境变量 STEAM_COOKIE。
 
     需包含 sessionid（发消息必需）与 steamLoginSecure/steamLogin（身份）。
     """
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(here, "steam_cookie.txt"), encoding="utf-8") as fh:
-            cookie = fh.read().strip()
-        if cookie:
-            return cookie
-    except OSError:
-        pass
+    cookie = _read_credential("steam_cookie.txt")
+    if cookie:
+        return cookie
     return os.environ.get("STEAM_COOKIE", "").strip()
 
 
@@ -329,32 +491,26 @@ def _cookie_value(cookie_text: str, name: str) -> str:
     return ""
 
 
-# ══════════ 凭证自动配置（v0.3.2：skip / yui / auto 三模式 + 验证） ══════════
-
-
-def _credential_dir() -> str:
-    return os.path.dirname(os.path.abspath(__file__))
+# ══════════ 凭证配置（v0.4.1：skip / yui / auto 三模式 + 验证） ══════════
 
 
 def save_api_key(key: str, path: str | None = None) -> str:
-    """把 Steam Web API Key 写入插件目录 steam_api_key.txt，返回写入路径。"""
+    """把 Steam Web API Key 加密写入用户数据目录，返回写入路径。"""
     key = (key or "").strip()
     if not key:
         raise ValueError("API Key 为空")
-    target = path or os.path.join(_credential_dir(), "steam_api_key.txt")
-    with open(target, "w", encoding="utf-8") as fh:
-        fh.write(key)
+    target = path or _credential_path("steam_api_key.txt")
+    _write_secret_file(target, key)
     return target
 
 
 def save_community_cookie(cookie: str, path: str | None = None) -> str:
-    """把 steamcommunity 登录 Cookie 写入插件目录 steam_cookie.txt，返回写入路径。"""
+    """把 steamcommunity 登录 Cookie 加密写入用户数据目录，返回写入路径。"""
     cookie = (cookie or "").strip()
     if not cookie:
         raise ValueError("Cookie 为空")
-    target = path or os.path.join(_credential_dir(), "steam_cookie.txt")
-    with open(target, "w", encoding="utf-8") as fh:
-        fh.write(cookie)
+    target = path or _credential_path("steam_cookie.txt")
+    _write_secret_file(target, cookie)
     return target
 
 
@@ -373,12 +529,14 @@ def validate_api_key(key: str) -> tuple[bool, str]:
             "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
             f"?key={urllib.parse.quote(key)}&steamids=76561197960287930"
         )
+    except SteamHTTPError as exc:
+        if exc.status in (401, 403):
+            return False, "Key 无效（接口返回 403/401，通常为 Key 错误或被禁用），请检查是否复制完整"
+        return False, f"验证请求失败（HTTP {exc.status}），请稍后重试"
     except OSError as exc:
-        if "HTTP 403" in str(exc):
-            return False, "Key 无效（接口返回 403，通常为 Key 错误或被禁用），请检查是否复制完整"
-        return False, f"验证请求失败：{exc}"
+        return False, f"验证请求失败：{redact_text(exc)}"
     except ValueError as exc:
-        return False, f"验证请求失败：{exc}"
+        return False, f"验证请求失败：{redact_text(exc)}"
     players = ((data.get("response") or {}).get("players"))
     if players:
         return True, "Key 有效（已通过官方接口验证）"
@@ -412,7 +570,7 @@ def validate_community_cookie(cookie: str) -> tuple[bool, str]:
     except urllib.error.HTTPError as exc:
         return False, f"验证请求失败（HTTP {exc.code}）"
     except OSError as exc:
-        return False, f"验证请求失败：{exc}"
+        return False, f"验证请求失败：{redact_text(exc)}"
     if "/profiles/" in final_url or "personaName" in body or '"steamid"' in body:
         return True, "Cookie 有效（已通过 steamcommunity 登录态验证）"
     return False, "Cookie 无效或已过期（未登录到个人资料页）"
@@ -428,137 +586,6 @@ def credentials_status() -> dict:
         "can_use_friends": bool(key),
         "can_reply_friend": bool(key and cookie),
     }
-
-
-# ══════════ 浏览器 Cookie 自动探测（v0.3.2：解密 Chrome/Edge 本地库） ══════════
-# 仅读取本机自己浏览器的 steamcommunity 登录 cookie，用于配置插件，不输出任何明文到对话。
-
-def _dpapi_unprotect(data: bytes) -> bytes:
-    """用当前 Windows 用户 DPAPI 解密（CryptUnprotectData）。"""
-    import ctypes
-    from ctypes import wintypes
-
-    class _DATA_BLOB(ctypes.Structure):
-        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
-
-    blob_in = _DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)))
-    blob_out = _DATA_BLOB()
-    if not ctypes.windll.crypt32.CryptUnprotectData(
-        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
-    ):
-        raise OSError("DPAPI 解密失败（CryptUnprotectData）")
-    try:
-        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
-    finally:
-        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
-
-
-def _chrome_aes_key(local_state_path: str) -> bytes:
-    """从 Local State 提取 AES-GCM 主密钥（DPAPI 解密 encrypted_key）。"""
-    import json
-
-    with open(local_state_path, "r", encoding="utf-8") as fh:
-        state = json.load(fh)
-    enc = state.get("os_crypt", {}).get("encrypted_key", "")
-    raw = base64.b64decode(enc)
-    if raw.startswith(b"DPAPI"):
-        return _dpapi_unprotect(raw[5:])
-    return raw  # v20：直接明文 AES key（少见）
-
-
-def _decrypt_cookie_value(encrypted_value: bytes, aes_key: bytes) -> str:
-    """解密 Chrome v10 cookie：3 字节 'v10' 前缀 + nonce(12) + AES-GCM 密文。"""
-    if encrypted_value.startswith(b"v10"):
-        nonce, ciphertext = encrypted_value[3:15], encrypted_value[15:]
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-        return AESGCM(aes_key).decrypt(nonce, ciphertext, None).decode("utf-8", errors="replace")
-    return encrypted_value.decode("utf-8", errors="replace")
-
-
-def _copy_cookie_db(src: str, dst: str) -> None:
-    """复制 Cookie 库到临时文件（浏览器运行中 SQLite 可能被锁）。"""
-    import shutil
-
-    shutil.copyfile(src, dst)
-
-
-def _iter_browser_cookie_dbs() -> list[tuple[str, str]]:
-    """枚举 Chrome/Edge 各 profile 的 Cookies 数据库与 Local State，返回 [(db, local_state)]。"""
-    candidates: list[tuple[str, str]] = []
-    for app in ("Google\\Chrome", "Microsoft\\Edge"):
-        root = os.path.join(os.environ.get("LOCALAPPDATA", ""), app, "User Data")
-        if not os.path.isdir(root):
-            continue
-        local_state = os.path.join(root, "Local State")
-        if not os.path.isfile(local_state):
-            continue
-        for entry in os.scandir(root):
-            if not entry.is_dir():
-                continue
-            db = os.path.join(entry.path, "Network", "Cookies")
-            if os.path.isfile(db):
-                candidates.append((db, local_state))
-    return candidates
-
-
-def probe_browser_cookies() -> dict:
-    """自动探测本机浏览器里 steamcommunity.com 的登录 cookie。
-
-    返回 {"found": bool, "browser": str, "sessionid": str, "steam_login_secure": str,
-          "steam_login": str, "error": str}；值仅供插件写入使用，调用方不得回显。
-    """
-    import sqlite3
-    import tempfile
-
-    wanted = {"sessionid", "steamLoginSecure", "steamLogin", "steamCountry"}
-    found: dict[str, str] = {}
-    used_browser = ""
-    last_error = ""
-    for db_path, local_state in _iter_browser_cookie_dbs():
-        try:
-            aes_key = _chrome_aes_key(local_state)
-        except Exception as exc:  # noqa: BLE001 - 单个 profile 失败不中断
-            last_error = f"{os.path.basename(os.path.dirname(os.path.dirname(db_path)))} 密钥解密失败：{exc}"
-            continue
-        tmp = os.path.join(tempfile.gettempdir(), f"cookies_probe_{os.getpid()}_{len(found)}.db")
-        try:
-            try:
-                _copy_cookie_db(db_path, tmp)
-            except OSError as exc:
-                last_error = f"复制 Cookie 库失败：{exc}"
-                continue
-            con = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
-            try:
-                rows = con.execute(
-                    "SELECT name, value, encrypted_value FROM cookies WHERE host_key LIKE '%steamcommunity.com%'"
-                ).fetchall()
-            finally:
-                con.close()
-            for name, value, enc in rows:
-                plain = value or _decrypt_cookie_value(enc, aes_key)
-                if name in wanted and name not in found:
-                    found[name] = plain
-            used_browser = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(db_path)))) or used_browser
-            if found.get("sessionid") and (found.get("steamLoginSecure") or found.get("steamLogin")):
-                break
-        except Exception as exc:  # noqa: BLE001
-            last_error = f"读取 Cookie 库失败：{exc}"
-        finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-    result = {
-        "found": bool(found.get("sessionid") and (found.get("steamLoginSecure") or found.get("steamLogin"))),
-        "browser": used_browser,
-        "sessionid": found.get("sessionid", ""),
-        "steam_login_secure": found.get("steamLoginSecure", ""),
-        "steam_login": found.get("steamLogin", ""),
-        "steam_country": found.get("steamCountry", ""),
-        "error": last_error if not found.get("sessionid") else "",
-    }
-    return result
 
 
 # ══════════ 本地账号（config/loginusers.vdf） ══════════
@@ -600,9 +627,56 @@ def read_local_account(steam_path: str | None) -> dict | None:
 
 # ══════════ HTTP 工具 ══════════
 
+_SECRET_QUERY_RX = re.compile(
+    r"(?i)(key|access_token|sessionid|steamloginsecure|steamlogin|cookie)=([^&\s\"']+)"
+)
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
-def _http_get_json(url: str, referer: str | None = None, timeout: float = 15.0) -> dict:
-    """GET 并解析 JSON。网络或解析失败抛 OSError/ValueError。"""
+
+class SteamHTTPError(OSError):
+    """带结构化状态码的 Steam HTTP 错误；消息不含完整 URL/API Key。"""
+
+    def __init__(self, status: int, reason: str = "") -> None:
+        super().__init__(f"HTTP {status}" + (f": {reason}" if reason else ""))
+        self.status = int(status)
+
+
+def redact_text(value: object, limit: int = 300) -> str:
+    """异常/日志文本脱敏：抹掉 query 里的 key、sessionid、cookie 等。"""
+    text = _SECRET_QUERY_RX.sub(r"\1=[redacted]", str(value or ""))
+    return text[:limit]
+
+
+def _safe_url(url: str) -> str:
+    """日志只记录 scheme/host/path，不记录带 API Key 的 query。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        return f"{parts.scheme}://{parts.netloc}{parts.path}"
+    except ValueError:
+        return "<invalid-url>"
+
+
+def _retry_after_seconds(headers) -> float:
+    """解析 Retry-After（秒数或 HTTP 日期），上限 10 秒，避免长时间阻塞。"""
+    raw = (headers or {}).get("Retry-After") if headers else None
+    if not raw:
+        return 0.0
+    raw = str(raw).strip()
+    if raw.isdigit():
+        return min(10.0, float(raw))
+    parsed = email.utils.parsedate_tz(raw)
+    if parsed:
+        return min(10.0, max(0.0, float(email.utils.mktime_tz(parsed)) - time.time()))
+    return 0.0
+
+
+def _http_get_json(
+    url: str, referer: str | None = None, timeout: float = 15.0, retries: int = 2
+) -> dict:
+    """GET 并解析 JSON；429/5xx 有限次退避重试，并遵守 Retry-After。
+
+    网络或解析失败抛 OSError/ValueError；HTTP 状态错误抛 SteamHTTPError。
+    """
     headers = {
         "User-Agent": _UA,
         "Accept": "application/json, text/plain, */*",
@@ -611,12 +685,26 @@ def _http_get_json(url: str, referer: str | None = None, timeout: float = 15.0) 
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        raise OSError(f"HTTP {exc.code}") from exc
-    return json.loads(raw)
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+            return json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            if exc.code in _RETRYABLE_STATUS and attempt < retries:
+                delay = _retry_after_seconds(exc.headers) or min(4.0, 2.0 ** attempt)
+                _logger.warning(
+                    "GET %s -> HTTP %s，%.1fs 后重试（%d/%d）",
+                    _safe_url(url), exc.code, delay, attempt + 1, retries,
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+            _logger.warning("GET %s -> HTTP %s", _safe_url(url), exc.code)
+            raise SteamHTTPError(exc.code, str(exc.reason or "")) from exc
+        except urllib.error.URLError as exc:
+            raise OSError(redact_text(f"网络请求失败：{exc.reason}")) from exc
 
 
 # ══════════ 账户信息（Steam Web API，需 Key） ══════════
@@ -657,8 +745,10 @@ def account_info(api_key: str, steam_id: str) -> dict | None:
 # ══════════ 好友列表（Steam Web API，需 Key） ══════════
 
 
-def _summaries_in_chunks(api_key: str, ids: list[str], chunk: int = 100) -> dict[str, dict]:
-    """GetPlayerSummaries 每次最多 100 个 steamid，超过必须分批（v0.3.1 修复）。"""
+def _summaries_in_chunks(
+    api_key: str, ids: list[str], chunk: int = 100, errors: list[str] | None = None
+) -> dict[str, dict]:
+    """GetPlayerSummaries 每批最多 100 个 steamid；失败批次记入 errors，不静默丢失。"""
     info_map: dict[str, dict] = {}
     for start in range(0, len(ids), chunk):
         batch = ids[start:start + chunk]
@@ -669,15 +759,21 @@ def _summaries_in_chunks(api_key: str, ids: list[str], chunk: int = 100) -> dict
             )
             for p in (sdata.get("response") or {}).get("players") or []:
                 info_map[str(p.get("steamid"))] = p
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as exc:
+            message = f"好友概要第 {start // chunk + 1} 批失败：{redact_text(exc)}"
+            _logger.warning("%s", message)
+            if errors is not None:
+                errors.append(message)
     return info_map
 
 
-def friend_list(api_key: str, steam_id: str, limit: int = 200) -> list[dict]:
+def friend_list(
+    api_key: str, steam_id: str, limit: int = 200, errors: list[str] | None = None
+) -> list[dict]:
     """查询指定账号的好友列表，合并每个好友的昵称/状态/头像。
 
     需 Steam Web API Key；好友超 100 人时自动分批获取概要（v0.3.1）。
+    部分批次失败时仍返回已获取的好友，并把失败原因写入 errors。
     """
     steam_id = (steam_id or "").strip()
     if not api_key or not steam_id:
@@ -689,7 +785,7 @@ def friend_list(api_key: str, steam_id: str, limit: int = 200) -> list[dict]:
     data = _http_get_json(url)
     friends = ((data.get("friendslist") or {}).get("friends")) or []
     ids = [str(f.get("steamid") or "") for f in friends if f.get("steamid")]
-    info_map = _summaries_in_chunks(api_key, ids)
+    info_map = _summaries_in_chunks(api_key, ids, errors=errors)
     out: list[dict] = []
     for f in friends[:limit]:
         sid = str(f.get("steamid") or "")
@@ -707,6 +803,7 @@ def friend_list(api_key: str, steam_id: str, limit: int = 200) -> list[dict]:
                 "name": str(p.get("personaname") or ""),
                 "state": _PERSONA_STATE.get(state, str(state)),
                 "avatar": str(p.get("avatarfull") or ""),
+                "summary_ok": sid in info_map,
             }
         )
     return out
@@ -755,7 +852,9 @@ def send_friend_message(cookie: str, my_steam_id: str, friend_steam_id: str, tex
         with urllib.request.urlopen(req, timeout=15.0) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
-        raise ValueError(f"发送失败（HTTP {exc.code}）") from exc
+        raise SteamHTTPError(exc.code, str(exc.reason or "")) from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"发送失败（网络错误）：{redact_text(exc.reason)}") from exc
     stripped = raw.strip()
     if stripped.startswith("["):
         try:
@@ -764,7 +863,7 @@ def send_friend_message(cookie: str, my_steam_id: str, friend_steam_id: str, tex
                 return {"ok": True, "to": friend_steam_id, "text": text}
         except ValueError:
             pass
-    raise ValueError(f"发送失败：{stripped[:120]}")
+    raise ValueError(f"发送失败：{redact_text(stripped[:120])}")
 
 
 # ══════════ 价格与促销（Steam Store 公开 API，无需凭证） ══════════

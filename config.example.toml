@@ -1,0 +1,4 @@
+[steam]
+# 游戏助手优先查找的窗口标题片段（不区分大小写）。
+# 玩其他游戏时改成对应窗口标题，例如 "factorio"、"terraria"；留空则不做 PrintWindow 直抓。
+game_window_title = "civilization vi"
