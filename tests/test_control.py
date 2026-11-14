@@ -217,19 +217,20 @@ def test_type_text_uses_sendinput_unicode(monkeypatch) -> None:
 def test_mouse_click_abs_clamps_to_screen(monkeypatch) -> None:
     from plugin.plugins.steam_manager import control
 
-    captured: list[tuple[int, int]] = []
+    captured: list[tuple[int, int, int]] = []
 
     class _FakeUser32:
         def mouse_event(self, flags, dx, dy, data, extra):
             if flags & control._MOUSEEVENTF_MOVE:
-                captured.append((dx, dy))
+                captured.append((flags, dx, dy))
 
     monkeypatch.setattr(control, "USER32", _FakeUser32())
-    monkeypatch.setattr(control, "_screen_size", lambda: (1920, 1080))
+    monkeypatch.setattr(control, "_screen_bounds", lambda: (0, 0, 1920, 1080))
     control.mouse_click_abs(-50, 2000)
-    assert captured == [(0, 65535)]
+    assert captured[0][1:] == (0, 65535)
+    assert captured[0][0] & control._MOUSEEVENTF_VIRTUALDESK
     control.mouse_click_abs(5000, -10)
-    assert captured[-1] == (65535, 0)
+    assert captured[-1][1:] == (65535, 0)
 
 
 def test_find_window_by_title_empty_without_user32(monkeypatch) -> None:
@@ -238,3 +239,126 @@ def test_find_window_by_title_empty_without_user32(monkeypatch) -> None:
     monkeypatch.setattr(control, "USER32", None)
     assert control.find_window_by_title("civilization vi") is None
     assert control.find_window_by_title("") is None
+
+
+# ══════════ v0.4.2：Win32 结构/签名、多显示器与线程竞态 ══════════
+
+
+def test_input_struct_matches_win32_layout() -> None:
+    """INPUT 必须包含鼠标/键盘/硬件三个 union 成员，否则 64 位下 SendInput 尺寸错误。"""
+    import ctypes
+    import sys
+
+    from plugin.plugins.steam_manager import control
+
+    expected = 40 if sys.maxsize > 2**32 else 28
+    assert ctypes.sizeof(control._INPUT) == expected
+    assert ctypes.sizeof(control._INPUTUNION) == expected - 8 if sys.maxsize > 2**32 else 24
+
+
+def test_type_text_passes_full_input_size(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import control
+
+    sizes: list[int] = []
+
+    class _FakeUser32:
+        def SendInput(self, count, events, size):
+            sizes.append(size)
+            return count
+
+    monkeypatch.setattr(control, "USER32", _FakeUser32())
+    assert control.type_text("A中") == 2
+    assert sizes == [control.ctypes.sizeof(control._INPUT)]
+
+
+def test_screen_bounds_uses_virtual_desktop(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import control
+
+    values = {76: -1920, 77: 0, 78: 3840, 79: 1080}
+
+    class _FakeUser32:
+        def GetSystemMetrics(self, index):
+            return values[index]
+
+    monkeypatch.setattr(control, "USER32", _FakeUser32())
+    assert control._screen_bounds() == (-1920, 0, 3840, 1080)
+
+
+def test_mouse_click_abs_maps_negative_virtual_origin(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import control
+
+    captured: list[tuple[int, int, int]] = []
+
+    class _FakeUser32:
+        def mouse_event(self, flags, dx, dy, data, extra):
+            if flags & control._MOUSEEVENTF_MOVE:
+                captured.append((flags, dx, dy))
+
+    monkeypatch.setattr(control, "USER32", _FakeUser32())
+    monkeypatch.setattr(control, "_screen_bounds", lambda: (-1920, 0, 3840, 1080))
+    control.mouse_click_abs(-1920, 0)
+    control.mouse_click_abs(1919, 1079)
+    assert captured[0][1:] == (0, 0)
+    assert captured[1][1:] == (65535, 65535)
+
+
+def test_cleanup_survives_single_stat_failure(tmp_path, monkeypatch) -> None:
+    """一个帧文件 stat 失败时，其余旧帧仍应被清理，而不是整批中止。"""
+    import os
+
+    from plugin.plugins.steam_manager import control
+
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    names = []
+    for i in range(1, 8):
+        path = frame_dir / f"frame_{i:04d}.png"
+        path.write_bytes(b"x")
+        os.utime(path, (1000 + i, 1000 + i))
+        names.append(path.name)
+
+    real_getmtime = os.path.getmtime
+    broken = frame_dir / names[-1]
+
+    def fake_getmtime(path):
+        if os.path.abspath(path) == os.path.abspath(broken):
+            raise OSError("stat failed")
+        return real_getmtime(path)
+
+    monkeypatch.setattr(control.os.path, "getmtime", fake_getmtime)
+    removed = control.cleanup_old_frames(str(frame_dir), keep=2)
+    assert removed == 4
+    assert set(f.name for f in frame_dir.iterdir()) == {names[-1], names[-2], names[-3]}
+
+
+def test_frame_watcher_refuses_second_thread_after_stop_timeout(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import control
+
+    state = control.ControlState()
+    watcher = control.FrameWatcher(state, interval=9.0)
+
+    class _StuckThread:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            return None
+
+        def start(self):
+            raise AssertionError("不应启动第二个线程")
+
+    watcher._thread = _StuckThread()
+    watcher._stop.set()
+    watcher.start()  # 不得创建/启动新线程
+    assert watcher._thread is not None
+
+
+def test_default_frame_dir_never_falls_back_to_cwd(monkeypatch, tmp_path) -> None:
+    from plugin.plugins.steam_manager import control
+
+    monkeypatch.setattr(control.os, "environ", {})
+    monkeypatch.setattr(control.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(control.os, "getcwd", lambda: str(tmp_path))
+    monkeypatch.setattr(control.os.path, "expanduser", lambda _p: str(tmp_path / "home"))
+    result = control._default_frame_dir()
+    assert result != str(tmp_path / "steam_manager" / "frames")

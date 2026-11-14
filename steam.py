@@ -410,6 +410,8 @@ def _read_secret_file(path: str) -> str:
     except OSError:
         return ""
     text = raw.decode("utf-8", errors="replace")
+    if text.startswith("NEKO_MIGRATED_V1"):
+        return ""
     marker = _CREDENTIAL_MARKER.strip()
     if text.startswith(marker):
         try:
@@ -456,6 +458,12 @@ def _read_credential(name: str) -> str:
         return ""
     try:
         _write_secret_file(primary, value)
+        # 删除失败时旧文件仍可能留着明文：先就地覆盖成占位符，再尝试删除。
+        try:
+            with open(legacy, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("NEKO_MIGRATED_V1\n")
+        except OSError as exc:
+            _logger.warning("credential legacy overwrite failed for %s: %s", name, exc)
         os.remove(legacy)
         _logger.info("migrated legacy plaintext credential %s to %s", name, primary)
     except OSError as exc:

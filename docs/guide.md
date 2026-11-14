@@ -72,5 +72,6 @@ v0.3.0 起同时充当 **Steam 账号/商店助手**：账户信息、好友列�
 ## 实现说明
 
 - 全部使用 Python 标准库 + ctypes（GDI 截屏存 PNG，失败回退 BMP；SendInput 发送 Unicode 文本），无第三方依赖
-- 截图文件保存于 `%TEMP%\steam_manager\frames\`，随监控滚动清理
+- 截图文件保存于 `%TEMP%\steam_manager\frames\`，随监控滚动清理；TEMP/TMP 缺失或会退化为当前工作目录时，回退到用户主目录下的 `.steam_manager\tmp`
+- 多显示器：鼠标绝对坐标使用 `SM_*VIRTUALSCREEN` 虚拟桌面边界，不再被钳到主屏
 - 非 Windows 环境：相关工具返回明确提示，不报错崩溃

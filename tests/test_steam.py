@@ -426,6 +426,27 @@ def test_legacy_plaintext_credential_migrates(monkeypatch, tmp_path) -> None:
     assert steam._read_secret_file(steam._credential_path("steam_api_key.txt")) == "LEGACY-KEY"
 
 
+def test_legacy_delete_failure_overwrites_plaintext(monkeypatch, tmp_path) -> None:
+    """旧文件删不掉时，也要先把明文就地覆盖成占位符，不能继续留密钥。"""
+    from plugin.plugins.steam_manager import steam
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.delenv("STEAM_MANAGER_DATA_DIR", raising=False)
+    monkeypatch.delenv("STEAM_API_KEY", raising=False)
+    legacy = tmp_path / "legacy_key.txt"
+    legacy.write_text("LEGACY-KEY", encoding="utf-8")
+    monkeypatch.setattr(steam, "_legacy_credential_path", lambda _name: str(legacy))
+
+    def deny_remove(_path):
+        raise OSError("file locked")
+
+    monkeypatch.setattr(steam.os, "remove", deny_remove)
+    assert steam.api_key() == "LEGACY-KEY"
+    assert legacy.exists()
+    assert "LEGACY-KEY" not in legacy.read_text(encoding="utf-8")
+    assert steam._read_secret_file(str(legacy)) == ""
+
+
 def test_redact_text_masks_api_key_and_cookie() -> None:
     from plugin.plugins.steam_manager import steam
 

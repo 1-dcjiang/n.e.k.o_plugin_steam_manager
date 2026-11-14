@@ -15,6 +15,7 @@ import ctypes.wintypes as wt
 import logging
 import os
 import struct
+import tempfile
 import threading
 import time
 from collections import deque
@@ -50,8 +51,41 @@ _MAX_FRAMES = 20
 _MAX_TIMELINE = 120
 _MIN_INTERVAL = 1.0
 _MAX_FRAME_FILES = 40
+_MOUSEEVENTF_VIRTUALDESK = 0x4000
+_SM_XVIRTUALSCREEN = 76
+_SM_YVIRTUALSCREEN = 77
+_SM_CXVIRTUALSCREEN = 78
+_SM_CYVIRTUALSCREEN = 79
 
-_FRAME_DIR = os.path.join(os.environ.get("TEMP", "."), "steam_manager", "frames")
+
+def _default_frame_dir() -> str:
+    """帧目录：优先系统临时目录；TEMP/TMP 缺失或退化成 CWD 时不写当前目录。"""
+    base = os.environ.get("TEMP") or os.environ.get("TMP") or tempfile.gettempdir()
+    try:
+        same_as_cwd = os.path.abspath(base) == os.path.abspath(os.getcwd())
+    except OSError:
+        same_as_cwd = False
+    if not base or same_as_cwd or not os.path.isdir(base):
+        home = os.path.expanduser("~")
+        if home and home != "~":
+            base = os.path.join(home, ".steam_manager", "tmp")
+        else:
+            base = tempfile.gettempdir()
+    return os.path.join(base, "steam_manager", "frames")
+
+
+_FRAME_DIR = _default_frame_dir()
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", wt.DWORD),
+        ("dwFlags", wt.DWORD),
+        ("time", wt.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
 
 
 class _KEYBDINPUT(ctypes.Structure):
@@ -64,8 +98,16 @@ class _KEYBDINPUT(ctypes.Structure):
     ]
 
 
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wt.DWORD),
+        ("wParamL", wt.WORD),
+        ("wParamH", wt.WORD),
+    ]
+
+
 class _INPUTUNION(ctypes.Union):
-    _fields_ = [("ki", _KEYBDINPUT)]
+    _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT)]
 
 
 class _INPUT(ctypes.Structure):
@@ -97,13 +139,95 @@ class _BitmapInfo(ctypes.Structure):
     _fields_ = [("bmiHeader", _BitmapInfoHeader), ("bmiColors", wt.DWORD * 3)]
 
 
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+
+def _set_sig(fn, argtypes, restype):
+    try:
+        fn.argtypes = argtypes
+        fn.restype = restype
+    except (AttributeError, TypeError) as exc:  # 某些精简 DLL 代理不暴露函数签名
+        _logger.debug("设置 Win32 签名失败：%s", exc)
+
+
+def _configure_win32() -> None:
+    """显式声明 Win32 签名。64 位下默认 c_int 返回值会把 HWND/HDC 句柄截断成 32 位。"""
+    if USER32 is not None:
+        _set_sig(USER32.GetForegroundWindow, [], wt.HWND)
+        _set_sig(USER32.GetWindowTextW, [wt.HWND, wt.LPWSTR, ctypes.c_int], ctypes.c_int)
+        _set_sig(USER32.GetWindowRect, [wt.HWND, ctypes.POINTER(_Rect)], wt.BOOL)
+        _set_sig(USER32.GetWindowLongW, [wt.HWND, ctypes.c_int], ctypes.c_long)
+        _set_sig(USER32.GetWindowThreadProcessId, [wt.HWND, ctypes.POINTER(wt.DWORD)], wt.DWORD)
+        _set_sig(USER32.EnumWindows, [_WNDENUMPROC, wt.LPARAM], wt.BOOL)
+        _set_sig(USER32.IsWindowVisible, [wt.HWND], wt.BOOL)
+        _set_sig(USER32.GetDC, [wt.HWND], ctypes.c_void_p)
+        _set_sig(USER32.GetWindowDC, [wt.HWND], ctypes.c_void_p)
+        _set_sig(USER32.ReleaseDC, [wt.HWND, ctypes.c_void_p], ctypes.c_int)
+        _set_sig(USER32.PrintWindow, [wt.HWND, ctypes.c_void_p, wt.UINT], wt.BOOL)
+        _set_sig(USER32.GetSystemMetrics, [ctypes.c_int], ctypes.c_int)
+        _set_sig(
+            USER32.mouse_event,
+            [wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_size_t],
+            None,
+        )
+        _set_sig(USER32.keybd_event, [wt.BYTE, wt.BYTE, wt.DWORD, ctypes.c_size_t], None)
+        _set_sig(
+            USER32.SendInput,
+            [wt.UINT, ctypes.POINTER(_INPUT), ctypes.c_int],
+            wt.UINT,
+        )
+    if GDI32 is not None:
+        _set_sig(GDI32.CreateCompatibleDC, [ctypes.c_void_p], ctypes.c_void_p)
+        _set_sig(
+            GDI32.CreateCompatibleBitmap,
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_int],
+            ctypes.c_void_p,
+        )
+        _set_sig(GDI32.SelectObject, [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_void_p)
+        _set_sig(
+            GDI32.BitBlt,
+            [
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_int, wt.DWORD,
+            ],
+            wt.BOOL,
+        )
+        _set_sig(
+            GDI32.GetDIBits,
+            [
+                ctypes.c_void_p, ctypes.c_void_p, wt.UINT, wt.UINT, ctypes.c_void_p,
+                ctypes.POINTER(_BitmapInfo), wt.UINT,
+            ],
+            ctypes.c_int,
+        )
+        _set_sig(GDI32.DeleteObject, [ctypes.c_void_p], wt.BOOL)
+        _set_sig(GDI32.DeleteDC, [ctypes.c_void_p], wt.BOOL)
+    if KERNEL32 is not None:
+        _set_sig(KERNEL32.OpenProcess, [wt.DWORD, wt.BOOL, wt.DWORD], wt.HANDLE)
+        _set_sig(
+            KERNEL32.QueryFullProcessImageNameW,
+            [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)],
+            wt.BOOL,
+        )
+        _set_sig(KERNEL32.CloseHandle, [wt.HANDLE], wt.BOOL)
+    if PSAPI is not None:
+        _set_sig(
+            PSAPI.GetModuleBaseNameW,
+            [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD],
+            wt.DWORD,
+        )
+
+
+_configure_win32()
+
+
 # ══════════ 窗口与进程信息 ══════════
 
 
 def _safe_call(fn, *args, default=None):
     try:
         return fn(*args)
-    except (OSError, AttributeError, ctypes.WinError):
+    except (OSError, AttributeError, ValueError, TypeError, ctypes.ArgumentError):
         return default
 
 
@@ -184,7 +308,7 @@ def capture_window_bmp(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
     bmi.bmiHeader.biCompression = _BI_RGB
     row_size = (width * 4 + 3) & ~3
     buf = ctypes.create_string_buffer(row_size * height)
-    GDI32.GetDIBits(hdc_mem, hbmp, 0, height, buf, ctypes.byref(bmi), 0)
+    GDI32.GetDIBits(hdc_mem, hbmp, 0, height, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(bmi), 0)
     GDI32.SelectObject(hdc_mem, old)
     GDI32.DeleteObject(hbmp)
     GDI32.DeleteDC(hdc_mem)
@@ -246,7 +370,7 @@ def find_window_by_title(title_hint: str) -> dict | None:
         return None
     found: list[int] = []
 
-    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    @_WNDENUMPROC
     def _enum(hwnd, _lparam):
         if USER32.IsWindowVisible(hwnd):
             title_buf = ctypes.create_unicode_buffer(512)
@@ -325,7 +449,9 @@ def capture_window_printwindow(info: dict, save_dir: str = _FRAME_DIR) -> str | 
                 bmi.bmiHeader.biCompression = _BI_RGB
                 row_size = (width * 4 + 3) & ~3
                 buf = ctypes.create_string_buffer(row_size * height)
-                if not GDI32.GetDIBits(hdc_mem, hbmp, 0, height, buf, ctypes.byref(bmi), 0):
+                if not GDI32.GetDIBits(
+                    hdc_mem, hbmp, 0, height, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(bmi), 0
+                ):
                     GDI32.SelectObject(hdc_mem, old)
                     return None
                 GDI32.SelectObject(hdc_mem, old)
@@ -342,20 +468,42 @@ def capture_window_printwindow(info: dict, save_dir: str = _FRAME_DIR) -> str | 
 
 
 def _screen_size() -> tuple[int, int]:
+    """主屏尺寸（保留旧接口）；多屏绝对坐标请用 _screen_bounds。"""
     return (USER32.GetSystemMetrics(0), USER32.GetSystemMetrics(1))
 
 
+def _screen_bounds() -> tuple[int, int, int, int]:
+    """虚拟桌面边界 (x, y, width, height)，覆盖所有显示器；失败时退回主屏。"""
+    if USER32 is None:
+        return (0, 0, 1, 1)
+    try:
+        vx = USER32.GetSystemMetrics(_SM_XVIRTUALSCREEN)
+        vy = USER32.GetSystemMetrics(_SM_YVIRTUALSCREEN)
+        vw = USER32.GetSystemMetrics(_SM_CXVIRTUALSCREEN)
+        vh = USER32.GetSystemMetrics(_SM_CYVIRTUALSCREEN)
+    except (AttributeError, OSError, ValueError, TypeError):
+        vx = vy = 0
+        vw = vh = 0
+    if vw <= 0 or vh <= 0:
+        sw, sh = _screen_size()
+        vx = vy = 0
+        vw, vh = max(1, sw), max(1, sh)
+    return vx, vy, vw, vh
+
+
 def mouse_click_abs(screen_x: int, screen_y: int) -> None:
-    """在屏幕绝对坐标点击左键；坐标自动 clamp 到屏幕范围内。"""
+    """在屏幕绝对坐标点击左键；坐标自动 clamp 到虚拟桌面（多显示器）范围内。"""
     if USER32 is None:
         return
-    sw, sh = _screen_size()
-    sx = max(0, min(sw - 1, int(screen_x)))
-    sy = max(0, min(sh - 1, int(screen_y)))
-    dx = int(sx * 65535 // max(1, sw - 1))
-    dy = int(sy * 65535 // max(1, sh - 1))
-    extra = ctypes.c_ulong(0)
-    USER32.mouse_event(_MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_MOVE, dx, dy, 0, extra)
+    vx, vy, vw, vh = _screen_bounds()
+    sx = max(vx, min(vx + vw - 1, int(screen_x)))
+    sy = max(vy, min(vy + vh - 1, int(screen_y)))
+    dx = int((sx - vx) * 65535 // max(1, vw - 1))
+    dy = int((sy - vy) * 65535 // max(1, vh - 1))
+    extra = ctypes.c_size_t(0)
+    USER32.mouse_event(
+        _MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_MOVE | _MOUSEEVENTF_VIRTUALDESK, dx, dy, 0, extra
+    )
     USER32.mouse_event(_MOUSEEVENTF_LEFTDOWN, 0, 0, 0, extra)
     USER32.mouse_event(_MOUSEEVENTF_LEFTUP, 0, 0, 0, extra)
 
@@ -364,7 +512,7 @@ def press_key(vk: int) -> None:
     """按下并抬起一个虚拟键；非 Windows 为 no-op。"""
     if USER32 is None:
         return
-    extra = ctypes.c_ulong(0)
+    extra = ctypes.c_size_t(0)
     USER32.keybd_event(vk, 0, 0, extra)
     USER32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, extra)
 
@@ -414,7 +562,13 @@ def window_client_to_screen(info: dict, rel_x: float, rel_y: float) -> tuple[int
     h = max(1, bottom - top)
     rel_x = max(0.0, min(1000.0, float(rel_x)))
     rel_y = max(0.0, min(1000.0, float(rel_y)))
-    return left + min(w - 1, int(w * rel_x / 1000)), top + min(h - 1, int(h * rel_y / 1000))
+    sx = left + min(w - 1, int(w * rel_x / 1000))
+    sy = top + min(h - 1, int(h * rel_y / 1000))
+    if USER32 is not None:
+        vx, vy, vw, vh = _screen_bounds()
+        sx = max(vx, min(vx + vw - 1, sx))
+        sy = max(vy, min(vy + vh - 1, sy))
+    return sx, sy
 
 
 # ══════════ 状态机（纯逻辑，可测） ══════════
@@ -429,7 +583,7 @@ class ControlState:
         self.last_window: dict | None = None
         self.frames: deque = deque(maxlen=max_frames)
         self.timeline: deque = deque(maxlen=max_timeline)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     # ── 时间线 ──
 
@@ -448,28 +602,32 @@ class ControlState:
     # ── 开关 ──
 
     def enable_watch(self) -> None:
-        if not self.watch_enabled:
-            self.watch_enabled = True
-            self.note_event("watch_start", "后台画面监控已开启")
+        with self._lock:
+            if not self.watch_enabled:
+                self.watch_enabled = True
+                self.note_event("watch_start", "后台画面监控已开启")
 
     def disable_watch(self) -> None:
-        if self.watch_enabled:
-            self.watch_enabled = False
-            self.note_event("watch_stop", "后台画面监控已关闭")
+        with self._lock:
+            if self.watch_enabled:
+                self.watch_enabled = False
+                self.note_event("watch_stop", "后台画面监控已关闭")
 
     def enable_control(self) -> bool:
         """开启接管。要求：窗口在场且有最近帧证据。"""
-        if not self.recent_window_active(within_seconds=30):
-            return False
-        if not self.control_enabled:
-            self.control_enabled = True
-            self.note_event("control_on", "YUI 接管已授权（键鼠模拟）")
-        return True
+        with self._lock:
+            if not self.recent_window_active(within_seconds=30):
+                return False
+            if not self.control_enabled:
+                self.control_enabled = True
+                self.note_event("control_on", "YUI 接管已授权（键鼠模拟）")
+            return True
 
     def disable_control(self) -> None:
-        if self.control_enabled:
-            self.control_enabled = False
-            self.note_event("control_off", "YUI 接管已交还")
+        with self._lock:
+            if self.control_enabled:
+                self.control_enabled = False
+                self.note_event("control_off", "YUI 接管已交还")
 
     # ── 查询 ──
 
@@ -509,12 +667,16 @@ def cleanup_old_frames(save_dir: str | None = None, keep: int = _MAX_FRAME_FILES
         for name in names
         if name.startswith("frame_") and name.lower().endswith((".png", ".bmp"))
     ]
-    try:
-        files.sort(key=os.path.getmtime, reverse=True)
-    except OSError:
-        return 0
+    # 单个文件 stat 失败不应中断整批清理；失败项跳过，保留原文件。
+    dated: list[tuple[float, str]] = []
+    for path in files:
+        try:
+            dated.append((os.path.getmtime(path), path))
+        except OSError as exc:
+            _logger.debug("读取帧时间失败，跳过清理 %s：%s", path, exc)
+    dated.sort(key=lambda item: item[0], reverse=True)
     removed = 0
-    for old in files[max(0, keep):]:
+    for _mtime, old in dated[max(0, keep):]:
         try:
             os.remove(old)
             removed += 1
@@ -531,19 +693,30 @@ class FrameWatcher:
         self._interval = max(_MIN_INTERVAL, float(interval))
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._lifecycle = threading.Lock()
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="steam-manager-watcher", daemon=True)
-        self._thread.start()
+        with self._lifecycle:
+            if self._thread and self._thread.is_alive():
+                if self._stop.is_set():
+                    # 上一次 stop 超时但线程仍在收尾：等它真正退出，绝不并发第二个线程。
+                    self._thread.join(timeout=2.0)
+                if self._thread and self._thread.is_alive():
+                    _logger.warning("上一帧监控线程尚未退出，拒绝启动第二个线程")
+                    return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._loop, name="steam-manager-watcher", daemon=True)
+            self._thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+        with self._lifecycle:
+            self._stop.set()
+            if self._thread:
+                self._thread.join(timeout=2.0)
+                if self._thread.is_alive():
+                    _logger.warning("帧监控线程 2s 内未退出，保留引用等待下次 stop/start")
+                else:
+                    self._thread = None
 
     def _loop(self) -> None:
         while not self._stop.is_set():
