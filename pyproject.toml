@@ -1,6 +1,6 @@
 [project]
 name = "steam_manager"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = []
 
 [tool.neko.build]
