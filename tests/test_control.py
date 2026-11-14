@@ -247,10 +247,15 @@ def test_find_window_by_title_empty_without_user32(monkeypatch) -> None:
 def test_input_struct_matches_win32_layout() -> None:
     """INPUT 必须包含鼠标/键盘/硬件三个 union 成员，否则 64 位下 SendInput 尺寸错误。"""
     import ctypes
+    import os
     import sys
+
+    import pytest
 
     from plugin.plugins.steam_manager import control
 
+    if os.name != "nt":
+        pytest.skip("Win32 结构体尺寸只在 Windows ABI 下有意义")
     expected = 40 if sys.maxsize > 2**32 else 28
     assert ctypes.sizeof(control._INPUT) == expected
     assert ctypes.sizeof(control._INPUTUNION) == expected - 8 if sys.maxsize > 2**32 else 24
