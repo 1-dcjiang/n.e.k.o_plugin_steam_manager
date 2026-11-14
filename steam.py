@@ -819,16 +819,35 @@ def account_info(api_key: str, steam_id: str) -> dict | None:
 
 
 def _summaries_in_chunks(
-    api_key: str, ids: list[str], chunk: int = 100, errors: list[str] | None = None
+    api_key: str,
+    ids: list[str],
+    chunk: int = 100,
+    errors: list[str] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, dict]:
-    """GetPlayerSummaries 每批最多 100 个 steamid；失败批次记入 errors，不静默丢失。"""
+    """GetPlayerSummaries 每批最多 100 个 steamid；失败批次记入 errors，不静默丢失。
+
+    deadline 是本操作的总时间点（time.monotonic）。好友很多时逐批查概要，
+    每批只能花剩余时间，超出就停止并明确告诉上层还剩多少人没拿到昵称。
+    """
     info_map: dict[str, dict] = {}
     for start in range(0, len(ids), chunk):
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.5:
+                msg = f"好友概要总时间预算用尽：剩余 {len(ids) - start} 位好友未获取昵称"
+                _logger.warning("%s", msg)
+                if errors is not None:
+                    errors.append(msg)
+                break
+        else:
+            remaining = 20.0
         batch = ids[start:start + chunk]
         try:
             sdata = _http_get_json(
                 "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
-                f"?key={urllib.parse.quote(api_key)}&steamids={urllib.parse.quote(','.join(batch))}"
+                f"?key={urllib.parse.quote(api_key)}&steamids={urllib.parse.quote(','.join(batch))}",
+                total_budget=min(20.0, remaining),
             )
             for p in (sdata.get("response") or {}).get("players") or []:
                 info_map[str(p.get("steamid"))] = p
@@ -841,24 +860,29 @@ def _summaries_in_chunks(
 
 
 def friend_list(
-    api_key: str, steam_id: str, limit: int = 200, errors: list[str] | None = None
+    api_key: str,
+    steam_id: str,
+    limit: int = 200,
+    errors: list[str] | None = None,
+    time_budget: float = 20.0,
 ) -> list[dict]:
     """查询指定账号的好友列表，合并每个好友的昵称/状态/头像。
 
     需 Steam Web API Key；好友超 100 人时自动分批获取概要（v0.3.1）。
-    部分批次失败时仍返回已获取的好友，并把失败原因写入 errors。
+    部分批次失败或总预算用尽时仍返回已获取的好友，并把原因写入 errors。
     """
     steam_id = (steam_id or "").strip()
     if not api_key or not steam_id:
         return []
+    deadline = time.monotonic() + max(1.0, float(time_budget))
     url = (
         "https://api.steampowered.com/ISteamUser/GetFriendList/v1/"
         f"?key={urllib.parse.quote(api_key)}&steamid={urllib.parse.quote(steam_id)}&relationship=friend"
     )
-    data = _http_get_json(url)
+    data = _http_get_json(url, total_budget=min(20.0, max(1.0, deadline - time.monotonic())))
     friends = ((data.get("friendslist") or {}).get("friends")) or []
     ids = [str(f.get("steamid") or "") for f in friends if f.get("steamid")]
-    info_map = _summaries_in_chunks(api_key, ids, errors=errors)
+    info_map = _summaries_in_chunks(api_key, ids, errors=errors, deadline=deadline)
     out: list[dict] = []
     selected = friends if limit <= 0 else friends[:limit]
     for f in selected:

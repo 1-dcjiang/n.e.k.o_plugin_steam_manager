@@ -276,7 +276,7 @@ class SteamManagerPlugin(NekoPluginBase):
         self._state.disable_watch()
         self._state.disable_control()
         # v0.4.6：关闭时清掉本次会话的截图帧，不在磁盘留下游戏画面。
-        await asyncio.to_thread(control.cleanup_old_frames, None, 0)
+        await asyncio.to_thread(control.cleanup_old_frames, None, 0, 0.0)
         return {"status": "shutdown"}
 
     # ══════════ Steam 基础工具 ══════════
@@ -1291,14 +1291,28 @@ class SteamManagerPlugin(NekoPluginBase):
             return {"output": "最近 15 秒内没有该游戏窗口的新画面，已拒绝操作。请先 game_capture 确认画面。", "is_error": True, "error": "WINDOW_MISSING"}
         if action == "click":
             sx, sy = control.window_client_to_screen(win, max(0, min(1000, x)), max(0, min(1000, y)))
-            await asyncio.to_thread(control.mouse_click_abs, sx, sy)
+            clicked = await asyncio.to_thread(control.mouse_click_abs, sx, sy)
+            if not clicked:
+                self._state.note_event("action_failed", f"click SendInput 失败 @ 屏幕 ({sx},{sy})")
+                return {
+                    "output": "点击失败：SendInput 没有注入完整事件（可能窗口权限更高或被系统拦截），本次未记成功。",
+                    "is_error": True,
+                    "error": "INPUT_FAILED",
+                }
             self._state.note_event("action", f"click ({x},{y}) → 屏幕 ({sx},{sy}) @ {_untrusted(win.get('title'))}")
             return {"output": f"已点击窗口内 ({x},{y})（屏幕 {sx},{sy}）。", "is_error": False}
         if action == "key":
             vk = _parse_vk(key)
             if vk is None:
                 return {"output": "key 参数无效：请输入单字母（如 'a'）、常用功能键名，或白名单内的虚拟键码。", "is_error": True, "error": "BAD_KEY"}
-            await asyncio.to_thread(control.press_key, vk)
+            pressed = await asyncio.to_thread(control.press_key, vk)
+            if not pressed:
+                self._state.note_event("action_failed", f"key SendInput 失败：{key}")
+                return {
+                    "output": "按键失败：SendInput 没有注入完整事件（可能窗口权限更高或被系统拦截），本次未记成功。",
+                    "is_error": True,
+                    "error": "INPUT_FAILED",
+                }
             self._state.note_event("action", f"key {key}")
             return {"output": f"已按键：{key}。", "is_error": False}
         if action == "text":

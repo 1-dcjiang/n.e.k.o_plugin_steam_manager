@@ -47,6 +47,7 @@ _GWL_STYLE = -16
 _WS_MINIMIZE = 0x20000000
 
 _KEYEVENTF_UNICODE = 0x0004
+_INPUT_MOUSE = 0
 _INPUT_KEYBOARD = 1
 _MAX_FRAMES = 20
 _MAX_TIMELINE = 120
@@ -527,30 +528,70 @@ def _screen_bounds() -> tuple[int, int, int, int]:
     return vx, vy, vw, vh
 
 
-def mouse_click_abs(screen_x: int, screen_y: int) -> None:
-    """在屏幕绝对坐标点击左键；坐标自动 clamp 到虚拟桌面（多显示器）范围内。"""
+def mouse_click_abs(screen_x: int, screen_y: int) -> bool:
+    """在屏幕绝对坐标点击左键；返回是否确认注入 3 个事件（UIPI 拦截时为 False）。"""
     if USER32 is None:
-        return
+        return False
     vx, vy, vw, vh = _screen_bounds()
     sx = max(vx, min(vx + vw - 1, int(screen_x)))
     sy = max(vy, min(vy + vh - 1, int(screen_y)))
     dx = int((sx - vx) * 65535 // max(1, vw - 1))
     dy = int((sy - vy) * 65535 // max(1, vh - 1))
     extra = ctypes.c_size_t(0)
+    send_input = getattr(USER32, "SendInput", None)
+    if send_input is not None:
+        events = (_INPUT * 3)()
+        for idx, flags in enumerate((
+            _MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_MOVE | _MOUSEEVENTF_VIRTUALDESK,
+            _MOUSEEVENTF_LEFTDOWN,
+            _MOUSEEVENTF_LEFTUP,
+        )):
+            ev = events[idx]
+            ev.type = _INPUT_MOUSE
+            ev.mi.dx = dx
+            ev.mi.dy = dy
+            ev.mi.mouseData = 0
+            ev.mi.dwFlags = flags
+            ev.mi.time = 0
+            ev.mi.dwExtraInfo = None
+        sent = send_input(3, events, ctypes.sizeof(_INPUT))
+        if sent != 3:
+            _logger.warning("鼠标 SendInput 只发送了 %s/3 个事件", sent)
+            return False
+        return True
+    # 精简 DLL 代理没有 SendInput 时退回 legacy，无法核对注入数。
     USER32.mouse_event(
         _MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_MOVE | _MOUSEEVENTF_VIRTUALDESK, dx, dy, 0, extra
     )
     USER32.mouse_event(_MOUSEEVENTF_LEFTDOWN, 0, 0, 0, extra)
     USER32.mouse_event(_MOUSEEVENTF_LEFTUP, 0, 0, 0, extra)
+    return True
 
 
-def press_key(vk: int) -> None:
-    """按下并抬起一个虚拟键；非 Windows 或非法键码为 no-op。"""
+def press_key(vk: int) -> bool:
+    """按下并抬起一个虚拟键；返回是否确认注入 2 个事件。"""
     if USER32 is None or not isinstance(vk, int) or not (1 <= vk <= 255):
-        return
+        return False
     extra = ctypes.c_size_t(0)
+    send_input = getattr(USER32, "SendInput", None)
+    if send_input is not None:
+        events = (_INPUT * 2)()
+        for idx, flags in enumerate((0, _KEYEVENTF_KEYUP)):
+            ev = events[idx]
+            ev.type = _INPUT_KEYBOARD
+            ev.ki.wVk = vk
+            ev.ki.wScan = 0
+            ev.ki.dwFlags = flags
+            ev.ki.time = 0
+            ev.ki.dwExtraInfo = None
+        sent = send_input(2, events, ctypes.sizeof(_INPUT))
+        if sent != 2:
+            _logger.warning("按键 SendInput 只发送了 %s/2 个事件", sent)
+            return False
+        return True
     USER32.keybd_event(vk, 0, 0, extra)
     USER32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, extra)
+    return True
 
 
 def _unicode_units(text: str) -> list[int]:
@@ -713,10 +754,13 @@ class ControlState:
 # ══════════ 后台监控线程 ══════════
 
 
-def cleanup_old_frames(save_dir: str | None = None, keep: int = _MAX_FRAME_FILES) -> int:
-    """删除帧目录中超出 keep 个的旧帧（同时覆盖 .png 与 .bmp），返回删除数。
+def cleanup_old_frames(
+    save_dir: str | None = None, keep: int = _MAX_FRAME_FILES, min_age: float = 120.0
+) -> int:
+    """删除超出 keep 个且至少 min_age 秒未更新的旧帧，返回删除数。
 
-    v0.3.5 起帧格式改为 PNG，但旧清理只匹配 .bmp，导致 PNG 帧无限增长。
+    v0.4.6 之前只按数量清理：连续截帧时刚返回给视觉通道的路径可能被立刻删掉。
+    现在保留最近 keep 个，并给所有帧 120 秒宽限；关停时要全清就显式传 min_age=0。
     """
     directory = save_dir or _FRAME_DIR
     try:
@@ -736,8 +780,11 @@ def cleanup_old_frames(save_dir: str | None = None, keep: int = _MAX_FRAME_FILES
         except OSError as exc:
             _logger.debug("读取帧时间失败，跳过清理 %s：%s", path, exc)
     dated.sort(key=lambda item: item[0], reverse=True)
+    now = time.time()
     removed = 0
-    for _mtime, old in dated[max(0, keep):]:
+    for mtime, old in dated[max(0, keep):]:
+        if now - mtime < min_age:
+            continue
         try:
             os.remove(old)
             removed += 1

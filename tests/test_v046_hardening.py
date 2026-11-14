@@ -152,6 +152,32 @@ def test_game_action_input_failure_is_reported(monkeypatch) -> None:
     assert "已输入" not in result["output"]
 
 
+def test_game_action_click_reports_input_failed(monkeypatch) -> None:
+    inst, control = _plugin()
+    target = _window()
+    inst._state.note_frame(target, r"C:\tmp\frame.bmp")
+    assert inst._state.enable_control(target) is True
+    monkeypatch.setattr(control, "get_foreground_window_info", lambda: target)
+    monkeypatch.setattr(control, "mouse_click_abs", lambda x, y: False)
+
+    result = _run(inst.game_action(action="click", x=10, y=20, parameters={}))
+    assert result["error"] == "INPUT_FAILED"
+    assert "已点击" not in result["output"]
+
+
+def test_game_action_key_reports_input_failed(monkeypatch) -> None:
+    inst, control = _plugin()
+    target = _window()
+    inst._state.note_frame(target, r"C:\tmp\frame.bmp")
+    assert inst._state.enable_control(target) is True
+    monkeypatch.setattr(control, "get_foreground_window_info", lambda: target)
+    monkeypatch.setattr(control, "press_key", lambda vk: False)
+
+    result = _run(inst.game_action(action="key", key="a", parameters={}))
+    assert result["error"] == "INPUT_FAILED"
+    assert "已按键" not in result["output"]
+
+
 def test_game_action_aborts_when_target_leaves_foreground(monkeypatch) -> None:
     inst, control = _plugin()
     target = _window()
@@ -160,12 +186,28 @@ def test_game_action_aborts_when_target_leaves_foreground(monkeypatch) -> None:
     monkeypatch.setattr(control, "get_foreground_window_info",
                         lambda: _window("Chrome", "chrome.exe", 777))
     clicked: list[tuple[int, int]] = []
-    monkeypatch.setattr(control, "mouse_click_abs", lambda x, y: clicked.append((x, y)))
+    monkeypatch.setattr(control, "mouse_click_abs", lambda x, y: clicked.append((x, y)) or True)
 
     result = _run(inst.game_action(action="click", x=10, y=20, parameters={}))
     assert result["error"] == "TARGET_NOT_FOREGROUND"
     assert clicked == []
     assert inst._state.control_enabled is False
+
+
+def test_friend_summaries_respects_deadline(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    def _no_http(*_a, **_k):
+        raise AssertionError("预算已耗尽，不应再发请求")
+
+    monkeypatch.setattr(steam, "_http_get_json", _no_http)
+    errors: list[str] = []
+    info = steam._summaries_in_chunks(
+        "KEY", ["1", "2", "3"], errors=errors, deadline=time.monotonic() - 1
+    )
+    assert info == {}
+    assert "预算用尽" in errors[0]
+    assert "3 位好友" in errors[0]
 
 
 # ══════════ A7 / A8：好友全量过滤 / 无价格不显示免费 ══════════

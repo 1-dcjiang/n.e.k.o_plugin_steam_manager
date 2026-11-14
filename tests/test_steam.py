@@ -279,7 +279,7 @@ def test_friend_list_batches_over_100(monkeypatch) -> None:
     fake_ids = [f"7656119{10000000 + i}" for i in range(150)]
     calls: list[str] = []
 
-    def fake_get(url, referer=None, timeout=15.0):
+    def fake_get(url, referer=None, timeout=15.0, **kwargs):
         calls.append(url)
         if "GetFriendList" in url:
             return {"friendslist": {"friends": [{"steamid": sid} for sid in fake_ids]}}
@@ -536,7 +536,7 @@ def test_summaries_in_chunks_records_partial_failure(monkeypatch) -> None:
     """某批概要失败时写入 errors，不静默丢批次。"""
     from plugin.plugins.steam_manager import steam
 
-    def _fake_get(url, referer=None, timeout=15.0):
+    def _fake_get(url, referer=None, timeout=15.0, **kwargs):
         if "steamids=2" in url:
             raise steam.SteamHTTPError(503, "Unavailable")
         return {"response": {"players": [{"steamid": "1", "personaname": "P1"}]}}
@@ -552,7 +552,7 @@ def test_summaries_in_chunks_records_partial_failure(monkeypatch) -> None:
 def test_friend_list_marks_partial(monkeypatch) -> None:
     from plugin.plugins.steam_manager import steam
 
-    def _fake_get(url, referer=None, timeout=15.0):
+    def _fake_get(url, referer=None, timeout=15.0, **kwargs):
         if "GetFriendList" in url:
             return {"friendslist": {"friends": [{"steamid": "1"}, {"steamid": "2"}]}}
         raise steam.SteamHTTPError(502, "Bad Gateway")

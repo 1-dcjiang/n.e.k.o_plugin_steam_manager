@@ -185,6 +185,41 @@ def test_cleanup_old_frames_keeps_recent(tmp_path, monkeypatch) -> None:
     assert remaining == sorted(names[-3:])
 
 
+def test_cleanup_keeps_recent_files_even_beyond_keep(tmp_path) -> None:
+    """连续截帧时，超出 keep 的新帧不能被立刻删掉（视觉通道可能还在读）。"""
+    import os
+    import time
+
+    from plugin.plugins.steam_manager import control
+
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    for i in range(6):
+        path = frame_dir / f"frame_{i}.png"
+        path.write_bytes(b"\x00")
+        now = time.time()
+        os.utime(path, (now, now))
+    assert control.cleanup_old_frames(str(frame_dir), keep=2, min_age=120) == 0
+    assert len(list(frame_dir.iterdir())) == 6
+
+
+def test_cleanup_deletes_old_files_beyond_keep(tmp_path) -> None:
+    import os
+    import time
+
+    from plugin.plugins.steam_manager import control
+
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    for i in range(6):
+        path = frame_dir / f"frame_{i}.png"
+        path.write_bytes(b"\x00")
+        old = time.time() - 300
+        os.utime(path, (old, old))
+    assert control.cleanup_old_frames(str(frame_dir), keep=2, min_age=120) == 4
+    assert len(list(frame_dir.iterdir())) == 2
+
+
 # ══════════ v0.4.1：Unicode 输入 / 鼠标边界 / 通用窗口 ══════════
 
 
@@ -213,6 +248,30 @@ def test_type_text_uses_sendinput_unicode(monkeypatch) -> None:
     assert events[0] == (ord("A"), control._KEYEVENTF_UNICODE)
     assert events[1][1] == control._KEYEVENTF_UNICODE | control._KEYEVENTF_KEYUP
     assert events[2][0] == 0x4E2D
+
+
+def test_mouse_click_reports_partial_sendinput(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import control
+
+    class _FakeUser32:
+        def SendInput(self, count, events, size):
+            return 2  # 3 个事件只注入 2 个
+
+    monkeypatch.setattr(control, "USER32", _FakeUser32())
+    monkeypatch.setattr(control, "_screen_bounds", lambda: (0, 0, 1920, 1080))
+    assert control.mouse_click_abs(100, 100) is False
+
+
+def test_press_key_reports_partial_sendinput(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import control
+
+    class _FakeUser32:
+        def SendInput(self, count, events, size):
+            return 1  # 2 个事件只注入 1 个
+
+    monkeypatch.setattr(control, "USER32", _FakeUser32())
+    assert control.press_key(0x41) is False
+    assert control.press_key(0) is False
 
 
 def test_mouse_click_abs_clamps_to_screen(monkeypatch) -> None:
