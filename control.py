@@ -139,7 +139,9 @@ class _BitmapInfo(ctypes.Structure):
     _fields_ = [("bmiHeader", _BitmapInfoHeader), ("bmiColors", wt.DWORD * 3)]
 
 
-_WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+_WNDENUMPROC = (ctypes.WINFUNCTYPE if hasattr(ctypes, "WINFUNCTYPE") else ctypes.CFUNCTYPE)(
+    wt.BOOL, wt.HWND, wt.LPARAM
+)
 
 
 def _set_sig(fn, argtypes, restype):
