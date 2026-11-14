@@ -557,6 +557,16 @@ def mouse_click_abs(screen_x: int, screen_y: int) -> bool:
         sent = send_input(3, events, ctypes.sizeof(_INPUT))
         if sent != 3:
             _logger.warning("鼠标 SendInput 只发送了 %s/3 个事件", sent)
+            if sent == 2:
+                release = (_INPUT * 1)()
+                release[0].type = _INPUT_MOUSE
+                release[0].mi.dwFlags = _MOUSEEVENTF_LEFTUP
+                try:
+                    released = send_input(1, release, ctypes.sizeof(_INPUT))
+                    if released != 1:
+                        _logger.warning("鼠标左键补偿抬起失败：SendInput 发送了 %s/1 个事件", released)
+                except OSError:
+                    _logger.exception("鼠标左键补偿抬起时 SendInput 异常")
             return False
         return True
     # 精简 DLL 代理没有 SendInput 时退回 legacy，无法核对注入数。
@@ -587,6 +597,17 @@ def press_key(vk: int) -> bool:
         sent = send_input(2, events, ctypes.sizeof(_INPUT))
         if sent != 2:
             _logger.warning("按键 SendInput 只发送了 %s/2 个事件", sent)
+            if sent == 1:
+                release = (_INPUT * 1)()
+                release[0].type = _INPUT_KEYBOARD
+                release[0].ki.wVk = vk
+                release[0].ki.dwFlags = _KEYEVENTF_KEYUP
+                try:
+                    released = send_input(1, release, ctypes.sizeof(_INPUT))
+                    if released != 1:
+                        _logger.warning("按键补偿抬起失败：SendInput 发送了 %s/1 个事件", released)
+                except OSError:
+                    _logger.exception("按键补偿抬起时 SendInput 异常")
             return False
         return True
     USER32.keybd_event(vk, 0, 0, extra)

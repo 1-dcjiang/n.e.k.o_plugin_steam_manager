@@ -484,14 +484,17 @@ def test_http_get_json_retries_429_then_succeeds(monkeypatch) -> None:
     calls: list[str] = []
 
     class _Resp:
+        def __init__(self):
+            self._body = io.BytesIO(json.dumps({"ok": True}).encode())
+
         def __enter__(self):
             return self
 
         def __exit__(self, *args):
             return False
 
-        def read(self):
-            return json.dumps({"ok": True}).encode()
+        def read(self, size=-1):
+            return self._body.read(size)
 
     class _Headers:
         @staticmethod

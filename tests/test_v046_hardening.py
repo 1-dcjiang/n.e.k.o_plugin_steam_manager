@@ -241,6 +241,33 @@ def test_friends_filter_runs_after_full_list(monkeypatch) -> None:
     assert "不可信数据" in result["output"]
 
 
+def test_friends_filter_does_not_claim_no_match_when_summaries_missing(monkeypatch) -> None:
+    inst, _control = _plugin()
+    from plugin.plugins.steam_manager import steam
+
+    def _friends(_key, _sid, _limit, errors):
+        errors.append("好友概要总时间预算用尽：剩余 1 位好友未获取昵称")
+        return [
+            {"steam_id": "1", "name": "Alice", "state": "在线", "summary_ok": True},
+            {"steam_id": "2", "name": "", "state": "离线", "summary_ok": False},
+        ]
+
+    monkeypatch.setattr(steam, "friend_list", _friends)
+    monkeypatch.setattr(steam, "api_key", lambda: "KEY")
+
+    async def _sid(_steam_id=""):
+        return "76561198000000000"
+
+    inst._steam_id = _sid
+    result = _run(inst.steam_friends(name_filter="Bob", parameters={}))
+    assert result["error"] == "MATCH_INCOMPLETE"
+    assert result["partial"] is True
+    assert result["unresolved"] == 1
+    assert "无法确认" in result["output"]
+    assert "已检查全部" not in result["output"]
+    assert "预算用尽" in result["output"]
+
+
 def test_game_price_unknown_is_not_free(monkeypatch) -> None:
     inst, _control = _plugin()
     from plugin.plugins.steam_manager import steam
@@ -291,6 +318,53 @@ def test_http_retry_respects_total_budget(monkeypatch) -> None:
     with pytest.raises(steam.SteamHTTPError):
         steam._http_get_json("https://example.com/x", total_budget=0.3, retries=3)
     assert time.monotonic() - start < 1.0
+
+
+def test_http_read_respects_total_budget(monkeypatch, patch_module_clock) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    class _Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = _Clock()
+
+    class _Socket:
+        def __init__(self):
+            self.timeouts: list[float] = []
+
+        def settimeout(self, value):
+            self.timeouts.append(value)
+
+    socket = _Socket()
+
+    class _Raw:
+        _sock = socket
+
+    class _Fp:
+        raw = _Raw()
+
+    class _Resp:
+        fp = _Fp()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _size=-1):
+            clock.now += 0.2  # 首个读取块返回时，0.1 秒总预算已经耗尽
+            return b'{"ok": true}'
+
+    patch_module_clock(monkeypatch, steam, monotonic=clock)
+    monkeypatch.setattr(steam.urllib.request, "urlopen", lambda *_a, **_k: _Resp())
+    with pytest.raises(steam.SteamHTTPError) as caught:
+        steam._http_get_json("https://example.com/x", total_budget=0.1, retries=0)
+    assert caught.value.status == 408
+    assert socket.timeouts and socket.timeouts[0] <= 0.1
 
 
 # ══════════ B1 / B2：Cookie 身份与 sessionid ══════════

@@ -253,24 +253,34 @@ def test_type_text_uses_sendinput_unicode(monkeypatch) -> None:
 def test_mouse_click_reports_partial_sendinput(monkeypatch) -> None:
     from plugin.plugins.steam_manager import control
 
+    calls: list[tuple[int, list[int]]] = []
+
     class _FakeUser32:
         def SendInput(self, count, events, size):
-            return 2  # 3 个事件只注入 2 个
+            calls.append((count, [events[i].mi.dwFlags for i in range(count)]))
+            return 2 if len(calls) == 1 else count  # 首次只注入移动 + 左键按下
 
     monkeypatch.setattr(control, "USER32", _FakeUser32())
     monkeypatch.setattr(control, "_screen_bounds", lambda: (0, 0, 1920, 1080))
     assert control.mouse_click_abs(100, 100) is False
+    assert len(calls) == 2  # 必须补偿性抬起，不能留下左键按下状态
+    assert calls[1] == (1, [control._MOUSEEVENTF_LEFTUP])
 
 
 def test_press_key_reports_partial_sendinput(monkeypatch) -> None:
     from plugin.plugins.steam_manager import control
 
+    calls: list[tuple[int, list[int]]] = []
+
     class _FakeUser32:
         def SendInput(self, count, events, size):
-            return 1  # 2 个事件只注入 1 个
+            calls.append((count, [events[i].ki.dwFlags for i in range(count)]))
+            return 1 if len(calls) == 1 else count  # 首次只注入按下
 
     monkeypatch.setattr(control, "USER32", _FakeUser32())
     assert control.press_key(0x41) is False
+    assert len(calls) == 2
+    assert calls[1] == (1, [control._KEYEVENTF_KEYUP])
     assert control.press_key(0) is False
 
 

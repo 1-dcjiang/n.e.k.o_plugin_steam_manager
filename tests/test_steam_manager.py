@@ -484,3 +484,27 @@ def test_bool_params_reject_string_false() -> None:
     entry = _run(inst.entry_run(action="control", on="false", parameters={}))
     assert entry["is_error"] is False
     assert inst._state.control_enabled is False
+
+
+def test_shutdown_clears_all_frames(monkeypatch) -> None:
+    inst = _plugin()
+    from plugin.plugins.steam_manager import control
+
+    class _Watcher:
+        stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    watcher = _Watcher()
+    inst._watcher = watcher
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        control, "cleanup_old_frames", lambda *args: calls.append(args) or 0
+    )
+    result = _run(inst.on_shutdown())
+    assert result["status"] == "shutdown"
+    assert watcher.stopped is True
+    assert calls == [(None, 0, 0.0)]
+    assert inst._state.watch_enabled is False
+    assert inst._state.control_enabled is False

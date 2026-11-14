@@ -489,21 +489,38 @@ class SteamManagerPlugin(NekoPluginBase):
         if not friends:
             return {"output": "未获取到好友列表（可能是 API Key 无效、隐私设置或没有好友）。", "is_error": True, "error": "NO_FRIENDS"}
         total = len(friends)
+        warnings = [steam.redact_text(e) for e in errors]
+        unresolved = sum(1 for f in friends if f.get("summary_ok") is False)
+        note = ""
+        if warnings:
+            note = f"\n⚠ 部分好友概要获取失败（{len(warnings)} 批），缺失昵称/状态的条目已保留 SteamID：\n" + "\n".join(warnings)
         if name_filter:
             friends = [f for f in friends if name_filter.lower() in f["name"].lower()]
             if not friends:
+                if unresolved:
+                    return {
+                        "output": (
+                            f"已获取概要的好友中没有确认匹配「{_untrusted(name_filter)}」的昵称；"
+                            f"另有 {unresolved} 位好友概要缺失，无法确认是否匹配。" + note
+                        ),
+                        "is_error": True,
+                        "error": "MATCH_INCOMPLETE",
+                        "friends": [],
+                        "partial": True,
+                        "warnings": warnings,
+                        "unresolved": unresolved,
+                    }
                 return {"output": f"没有昵称匹配「{name_filter}」的好友（已检查全部 {total} 位好友）。", "is_error": True, "error": "NO_MATCH"}
         lines = [f"{_untrusted(f['name'] or '（昵称缺失）')}（{f['state']}，SteamID {f['steam_id']}）" for f in friends]
-        note = ""
-        warnings = [steam.redact_text(e) for e in errors]
-        if warnings:
-            note = f"\n⚠ 部分好友概要获取失败（{len(warnings)} 批），缺失昵称/状态的条目已保留 SteamID：\n" + "\n".join(warnings)
+        if unresolved and name_filter:
+            note += f"\n⚠ 另有 {unresolved} 位好友概要缺失，可能还有未确认的匹配项。"
         return {
             "output": f"共 {len(friends)} 位好友：\n" + "\n".join(lines) + note,
             "is_error": False,
             "friends": friends,
-            "partial": bool(warnings),
+            "partial": bool(warnings) or unresolved > 0,
             "warnings": warnings,
+            "unresolved": unresolved,
         }
 
     @llm_tool(

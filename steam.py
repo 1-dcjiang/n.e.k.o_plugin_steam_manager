@@ -751,15 +751,30 @@ def _http_get_json(
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
     attempt = 0
-    deadline = time.monotonic() + max(1.0, float(total_budget))
+    deadline = time.monotonic() + max(0.0, float(total_budget))
     while True:
         remaining = deadline - time.monotonic()
-        if remaining <= 0.05:
+        if remaining <= 0:
             raise SteamHTTPError(408, f"请求超出 {total_budget:g}s 总预算")
         try:
             with urllib.request.urlopen(req, timeout=min(timeout, remaining)) as resp:
-                raw = resp.read()
-            return json.loads(raw)
+                chunks = []
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise SteamHTTPError(408, f"请求超出 {total_budget:g}s 总预算")
+                    fp = getattr(resp, "fp", None)
+                    raw_fp = getattr(fp, "raw", None)
+                    sock = getattr(raw_fp, "_sock", None) or getattr(fp, "_sock", None)
+                    if sock is not None:
+                        sock.settimeout(min(timeout, remaining))
+                    chunk = resp.read(64 * 1024)
+                    if time.monotonic() >= deadline:
+                        raise SteamHTTPError(408, f"请求超出 {total_budget:g}s 总预算")
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            return json.loads(b"".join(chunks))
         except urllib.error.HTTPError as exc:
             if exc.code in _RETRYABLE_STATUS and attempt < retries:
                 delay = _retry_after_seconds(exc.headers) or min(2.0, 1.0 + attempt)
