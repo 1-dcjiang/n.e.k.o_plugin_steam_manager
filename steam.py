@@ -636,7 +636,7 @@ def read_local_account(steam_path: str | None) -> dict | None:
 # ══════════ HTTP 工具 ══════════
 
 _SECRET_QUERY_RX = re.compile(
-    r"(?i)(key|access_token|sessionid|steamloginsecure|steamlogin|cookie)=([^&\s\"']+)"
+    r"(?i)(key|access_token|token|sessionid|steamloginsecure|steamlogin|cookie|password|secret)=([^&\s\"']+)"
 )
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 

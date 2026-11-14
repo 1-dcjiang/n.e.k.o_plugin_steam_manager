@@ -9,12 +9,13 @@ import asyncio
 
 
 def _plugin():
-    from plugin.plugins.steam_manager import SteamManagerPlugin
+    from plugin.plugins.steam_manager import SteamManagerPlugin, control
 
     inst = SteamManagerPlugin.__new__(SteamManagerPlugin)
     inst._steam_path = None
     inst._watcher = None
-    inst._state = None
+    inst._state = control.ControlState()
+    inst._pending_confirms = {}
     return inst
 
 
@@ -105,6 +106,18 @@ def test_parse_vk() -> None:
     assert _parse_vk("abc") is None
 
 # ══════════ v0.3.2：凭证自动配置（工具层） ══════════
+
+
+def test_credentials_skip_mode_rejects_passed_credentials() -> None:
+    inst = _plugin()
+    result = _run(inst.steam_credentials(mode="skip", api_key="A", parameters={}))
+    assert result["error"] == "MODE_CONFLICT"
+
+
+def test_credentials_unknown_mode_rejected() -> None:
+    inst = _plugin()
+    result = _run(inst.steam_credentials(mode="whatever", parameters={}))
+    assert result["error"] == "INVALID_MODE"
 
 
 def test_credentials_skip_mode() -> None:
@@ -319,9 +332,10 @@ def test_reply_friend_substring_requires_confirm(monkeypatch) -> None:
 
     need = _run(inst.steam_reply_friend(friend="Alice", text="hi"))
     assert need["error"] == "CONFIRM_REQUIRED"
+    token = need["confirm_token"]
     assert sent == []
 
-    ok = _run(inst.steam_reply_friend(friend="Alice", text="hi", confirm=True))
+    ok = _run(inst.steam_reply_friend(friend="Alice", text="hi", confirm_token=token))
     assert ok["is_error"] is False
     assert sent == [("76561198000000001", "hi")]
 
@@ -335,9 +349,10 @@ def test_reply_friend_no_key_steam_id_requires_confirm(monkeypatch) -> None:
 
     need = _run(inst.steam_reply_friend(friend="76561198000000001", text="hi"))
     assert need["error"] == "CONFIRM_REQUIRED"
+    token = need["confirm_token"]
     assert sent == []
 
-    ok = _run(inst.steam_reply_friend(friend="76561198000000001", text="hi", confirm=True))
+    ok = _run(inst.steam_reply_friend(friend="76561198000000001", text="hi", confirm_token=token))
     assert ok["is_error"] is False
     assert sent == [("76561198000000001", "hi")]
 
@@ -346,16 +361,20 @@ def test_reply_friend_partial_errors_surfaced_on_success(monkeypatch) -> None:
     inst, steam = _reply_plugin(monkeypatch)
 
     def _friends(_key, _sid, _limit, errors):
-        errors.append("第 1 批概要获取失败")
+        errors.append("第 1 批概要获取失败 token=SECRETVALUE")
         return [{"steam_id": "76561198000000001", "name": "Alice"}]
 
     monkeypatch.setattr(steam, "friend_list", _friends)
     monkeypatch.setattr(steam, "send_friend_message", lambda *a: {"ok": True})
 
-    result = _run(inst.steam_reply_friend(friend="Alice", text="hi"))
-    assert result["is_error"] is False
-    assert result["partial"] is True
-    assert "好友概要部分失败" in result["output"]
+    need = _run(inst.steam_reply_friend(friend="Alice", text="hi"))
+    assert need["error"] == "CONFIRM_REQUIRED"
+    ok = _run(inst.steam_reply_friend(friend="Alice", text="hi", confirm_token=need["confirm_token"]))
+    assert ok["is_error"] is False
+    assert ok["partial"] is True
+    assert "好友概要部分失败" in ok["output"]
+    assert "SECRETVALUE" not in ok["output"]
+    assert "[redacted]" in ok["warnings"][0]
 
 
 def test_reply_friend_rejects_over_500_chars() -> None:
@@ -398,6 +417,55 @@ def test_open_app_uninstalled_requires_confirm(monkeypatch) -> None:
     assert need["error"] == "CONFIRM_REQUIRED"
     assert opened == []
 
-    ok = _run(inst.steam_open_app(game="My Game", confirm=True))
+    ok = _run(inst.steam_open_app(game="My Game", confirm_token=need["confirm_token"]))
     assert ok["is_error"] is False
     assert opened == ["123"]
+
+
+def test_reply_friend_confirm_token_is_one_time_and_bound(monkeypatch) -> None:
+    """令牌与好友/消息绑定、只能使用一次，不能拿旧令牌发另一条消息。"""
+    inst, steam = _reply_plugin(monkeypatch)
+    sent: list[str] = []
+    monkeypatch.setattr(steam, "friend_list", lambda *a: [
+        {"steam_id": "76561198000000001", "name": "Alice Smith"},
+    ])
+    monkeypatch.setattr(steam, "send_friend_message", lambda _c, _s, target, text: sent.append(text) or {"ok": True})
+
+    need = _run(inst.steam_reply_friend(friend="Alice", text="first"))
+    token = need["confirm_token"]
+
+    mismatch = _run(inst.steam_reply_friend(friend="Alice", text="second", confirm_token=token))
+    assert mismatch["error"] == "CONFIRM_TOKEN_INVALID"
+    assert sent == []
+
+    replay = _run(inst.steam_reply_friend(friend="Alice", text="first", confirm_token=token))
+    assert replay["error"] == "CONFIRM_TOKEN_INVALID"
+    assert sent == []
+
+
+def test_entry_run_forwards_confirm_token(monkeypatch) -> None:
+    """走 run 入口时也必须能把一次性令牌传给 reply_friend。"""
+    inst, steam = _reply_plugin(monkeypatch)
+    sent: list[str] = []
+    monkeypatch.setattr(steam, "friend_list", lambda *a: [
+        {"steam_id": "76561198000000001", "name": "Alice Smith"},
+    ])
+    monkeypatch.setattr(steam, "send_friend_message", lambda _c, _s, target, text: sent.append(text) or {"ok": True})
+
+    need = _run(inst.entry_run(action="reply", friend="Alice", text="hi", parameters={}))
+    assert need["error"] == "CONFIRM_REQUIRED"
+    ok = _run(inst.entry_run(action="reply", friend="Alice", text="hi", confirm_token=need["confirm_token"], parameters={}))
+    assert ok["is_error"] is False
+    assert sent == ["hi"]
+
+
+def test_bool_params_reject_string_false() -> None:
+    """字符串 "false" 不能因为 bool("false") 反而开启接管。"""
+    inst = _plugin()
+    result = _run(inst.take_control(on="false", parameters={}))
+    assert result["is_error"] is False
+    assert inst._state.control_enabled is False
+
+    entry = _run(inst.entry_run(action="control", on="false", parameters={}))
+    assert entry["is_error"] is False
+    assert inst._state.control_enabled is False

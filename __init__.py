@@ -1,4 +1,4 @@
-"""steam_manager — Steam 管理 + 游戏助手（v0.4.4）。
+"""steam_manager — Steam 管理 + 游戏助手（v0.4.5）。
 
 安全边界：只读本地库元数据；启动游戏需用户明确指令；截图与行为跟踪
 仅在用户开启监控后运行；键鼠接管（YUI 操作游戏）默认关闭，必须由
@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import time
 import webbrowser
 
@@ -26,6 +27,22 @@ from plugin.sdk.plugin import (
 from . import control, steam
 
 _logger = logging.getLogger("N.E.K.O.Plugin_steam_manager")
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    """显式解析布尔参数：字符串 "false" 必须得到 False，而不是 bool("false")=True。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "是", "开启"):
+        return True
+    if text in ("0", "false", "no", "off", "否", "关闭"):
+        return False
+    return default
 
 
 def _to_png(bmp_path: str) -> str:
@@ -90,6 +107,50 @@ class SteamManagerPlugin(NekoPluginBase):
         self._state = control.ControlState()
         self._watcher = control.FrameWatcher(self._state)
         self._game_window_title = "civilization vi"
+        self._pending_confirms: dict[str, dict] = {}
+
+    def _issue_confirm(self, kind: str, **payload) -> str:
+        """发出一次性确认令牌，把“确认”绑定到具体候选与参数，而不是一个可跳过的布尔值。"""
+        now = time.monotonic()
+        pending = getattr(self, "_pending_confirms", None)
+        if pending is None:
+            pending = self._pending_confirms = {}
+        for token in [t for t, item in pending.items() if item.get("expires", 0) < now]:
+            pending.pop(token, None)
+        token = secrets.token_urlsafe(12)
+        pending[token] = {"kind": kind, "expires": now + 300, **payload}
+        return token
+
+    def _consume_confirm(self, token: str, kind: str, **expected) -> dict | None:
+        """消费一次性令牌；过期、类型不符或参数不匹配都视为无效。"""
+        token = str(token or "").strip()
+        if not token:
+            return None
+        pending = getattr(self, "_pending_confirms", {})
+        item = pending.pop(token, None)
+        if not item or item.get("kind") != kind or item.get("expires", 0) < time.monotonic():
+            return None
+        for key, value in expected.items():
+            if item.get(key) != value:
+                return None
+        return item
+
+    def _friend_confirm_required(self, friend: str, text: str, target: dict, reason: str, warnings: list[str]) -> dict:
+        token = self._issue_confirm(
+            "friend",
+            friend=friend,
+            text=text,
+            friend_sid=target["steam_id"],
+            friend_label=target.get("name") or target["steam_id"],
+            warnings=warnings,
+        )
+        return {
+            "output": reason + "确认后带 confirm_token 重试（5 分钟内有效，仅能使用一次）。",
+            "is_error": True,
+            "error": "CONFIRM_REQUIRED",
+            "confirm_token": token,
+            "result": {"steam_id": target["steam_id"], "name": target.get("name") or ""},
+        }
 
     # ══════════ 跨插件优先级：civ6 运营锁让位 ══════════
     # civ6_buddy 运营托管期间写 `%LOCALAPPDATA%\N.E.K.O\config\civ6_ops_active`（带时间戳），
@@ -366,14 +427,15 @@ class SteamManagerPlugin(NekoPluginBase):
                 return {"output": f"没有昵称匹配「{name_filter}」的好友。", "is_error": True, "error": "NO_MATCH"}
         lines = [f"{f['name'] or '（昵称缺失）'}（{f['state']}，SteamID {f['steam_id']}）" for f in friends]
         note = ""
-        if errors:
-            note = f"\n⚠ 部分好友概要获取失败（{len(errors)} 批），缺失昵称/状态的条目已保留 SteamID：\n" + "\n".join(errors)
+        warnings = [steam.redact_text(e) for e in errors]
+        if warnings:
+            note = f"\n⚠ 部分好友概要获取失败（{len(warnings)} 批），缺失昵称/状态的条目已保留 SteamID：\n" + "\n".join(warnings)
         return {
             "output": f"共 {len(friends)} 位好友：\n" + "\n".join(lines) + note,
             "is_error": False,
             "friends": friends,
-            "partial": bool(errors),
-            "warnings": errors,
+            "partial": bool(warnings),
+            "warnings": warnings,
         }
 
     @llm_tool(
@@ -382,8 +444,8 @@ class SteamManagerPlugin(NekoPluginBase):
             "给 Steam 好友发送一条消息（网页聊天）。何时用：用户明确要求'给 XX 发消息/回复好友/跟 XX 说一句'时。"
             "需要：① STEAM_API_KEY（解析好友名→SteamID）；② steamcommunity 登录 Cookie（含 sessionid，DPAPI 加密保存）。"
             "参数 friend：好友昵称或 64 位 SteamID；text：消息内容（最长 500 字，超出会拒绝）；"
-            "confirm：昵称只有子串匹配、或没有 API Key 直接按 17 位 SteamID 发送时，先不带 confirm 调用取得候选，"
-            "用户确认后再带 confirm=true 发送。"
+            "confirm_token：昵称只有子串匹配、好友概要部分失败、或没有 API Key 直接按 17 位 SteamID 发送时，"
+            "先调用取得 CONFIRM_REQUIRED 返回的一次性令牌，用户确认后再回传该令牌（5 分钟有效，仅一次）。"
             "安全：这是对外写操作，仅在用户明确要求发送时调用；发送成功后原样回复'已发送。'，不复述消息内容。"
         ),
         parameters={
@@ -391,20 +453,20 @@ class SteamManagerPlugin(NekoPluginBase):
             "properties": {
                 "friend": {"type": "string", "description": "好友昵称或 64 位 SteamID"},
                 "text": {"type": "string", "description": "消息内容，最长 500 字"},
-                "confirm": {"type": "boolean", "description": "仅子串匹配/无 Key 直发 SteamID 时，用户确认后传 true"},
+                "confirm_token": {"type": "string", "description": "CONFIRM_REQUIRED 返回的一次性确认令牌"},
             },
             "required": ["friend", "text"],
         },
         timeout=30.0,
     )
-    async def steam_reply_friend(self, *, friend: str = "", text: str = "", confirm: bool = False, **_):
+    async def steam_reply_friend(self, *, friend: str = "", text: str = "", confirm_token: str = "", **_):
         _y = self._civ6_ops_yield()
         if _y:
             return _y
         params = _.get("parameters") or {}
         friend = (friend or params.get("friend") or "").strip()
         text = (text or params.get("text") or "").strip()
-        confirm = bool(params.get("confirm", confirm))
+        confirm_token = str(confirm_token or params.get("confirm_token") or "").strip()
         if not friend or not text:
             return {"output": "请提供好友（昵称或 SteamID）和消息内容。", "is_error": True, "error": "EMPTY"}
         if len(text) > 500:
@@ -419,31 +481,39 @@ class SteamManagerPlugin(NekoPluginBase):
         friend_sid = ""
         friend_label = friend
         friend_errors: list[str] = []
-        if not key:
-            # 没有 API Key 就无法核验好友关系；只接受明确的 17 位 SteamID，并要求二次确认。
-            if friend.isdigit() and len(friend) == 17:
-                if not confirm:
-                    return {
-                        "output": (
-                            f"未配置 STEAM_API_KEY，无法核验 SteamID {friend} 是否为好友。"
-                            "确认仍要发送请带 confirm=true。"
-                        ),
-                        "is_error": True,
-                        "error": "CONFIRM_REQUIRED",
-                        "result": {"steam_id": friend},
-                    }
-                friend_sid = friend
-            else:
+        pending_warnings: list[str] = []
+        warnings: list[str] = []
+        if confirm_token:
+            pending = self._consume_confirm(confirm_token, "friend", friend=friend, text=text)
+            if not pending:
+                return {
+                    "output": "确认令牌无效、已过期，或与本次好友/消息不匹配。请重新发起确认。",
+                    "is_error": True,
+                    "error": "CONFIRM_TOKEN_INVALID",
+                }
+            friend_sid = pending["friend_sid"]
+            friend_label = pending.get("friend_label") or friend_sid
+            pending_warnings = list(pending.get("warnings") or [])
+            warnings = pending_warnings
+        if not friend_sid:
+            if not key:
+                # 没有 API Key 就无法核验好友关系；只接受明确的 17 位 SteamID，并要求一次性令牌确认。
+                if friend.isdigit() and len(friend) == 17:
+                    return self._friend_confirm_required(
+                        friend, text, {"steam_id": friend, "name": ""},
+                        f"未配置 STEAM_API_KEY，无法核验 SteamID {friend} 是否为好友。",
+                        [],
+                    )
                 return {
                     "output": "按昵称发送需要 STEAM_API_KEY（用于解析昵称）；没有 Key 时请提供 17 位 SteamID。",
                     "is_error": True,
                     "error": "NO_API_KEY",
                 }
-        if not friend_sid:
             try:
                 friends = await asyncio.to_thread(steam.friend_list, key, sid, 10000, friend_errors)
             except (OSError, ValueError) as exc:
                 return {"output": f"好友列表查询失败：{steam.redact_text(exc)}", "is_error": True, "error": "FRIEND_LIST_FAILED"}
+            warnings = [steam.redact_text(e) for e in friend_errors]
             # 精确匹配优先：同名或同 SteamID 才算确定目标；纯数字输入绝不做子串匹配。
             exact: dict[str, dict] = {}
             query_fold = friend.casefold()
@@ -458,11 +528,18 @@ class SteamManagerPlugin(NekoPluginBase):
                 target = next(iter(exact.values()))
                 friend_sid = target["steam_id"]
                 friend_label = target.get("name") or friend_sid
+                # 好友概要部分失败时，缺失批次里可能还有同名好友；精确昵称也要确认。
+                if warnings and not (friend.isdigit() and friend == target["steam_id"]):
+                    return self._friend_confirm_required(
+                        friend, text, target,
+                        f"好友概要部分失败（{len(warnings)} 批），精确同名好友可能仍在缺失批次里；",
+                        warnings,
+                    )
             elif len(exact) > 1:
                 cand = "、".join(f"{f.get('name') or f['steam_id']}（{f['steam_id']}）" for f in list(exact.values())[:8])
                 return {"output": f"「{friend}」同时匹配到多个昵称/SteamID，请明确指定：{cand}", "is_error": True, "error": "AMBIGUOUS"}
             elif friend.isdigit():
-                extra = "（好友概要部分失败，可能漏匹配）" if friend_errors else ""
+                extra = "（好友概要部分失败，可能漏匹配）" if warnings else ""
                 return {
                     "output": f"数字输入「{friend}」既不是好友 SteamID，也没有同名好友；为避免发错人，不按子串匹配{extra}。可先用 steam_friends 核对。",
                     "is_error": True,
@@ -471,24 +548,18 @@ class SteamManagerPlugin(NekoPluginBase):
             else:
                 matches = [f for f in friends if query_fold in (f.get("name") or "").casefold()]
                 if not matches:
-                    extra = "（好友概要部分失败，可能漏匹配）" if friend_errors else ""
+                    extra = "（好友概要部分失败，可能漏匹配）" if warnings else ""
                     return {"output": f"在好友列表中没有找到「{friend}」{extra}。可先用 steam_friends 查看好友。", "is_error": True, "error": "NO_FRIEND"}
                 if len(matches) > 1:
                     cand = "、".join(f"{f['name'] or f['steam_id']}（{f['steam_id']}）" for f in matches[:8])
                     return {"output": f"「{friend}」匹配到多个好友，请指定 SteamID：{cand}", "is_error": True, "error": "AMBIGUOUS"}
                 target = matches[0]
-                if not confirm:
-                    return {
-                        "output": (
-                            f"「{friend}」没有精确同名好友，仅子串匹配到「{target.get('name') or target['steam_id']}」"
-                            f"（{target['steam_id']}）。确认要发给这个好友请带 confirm=true。"
-                        ),
-                        "is_error": True,
-                        "error": "CONFIRM_REQUIRED",
-                        "result": {"steam_id": target["steam_id"], "name": target.get("name") or ""},
-                    }
-                friend_sid = target["steam_id"]
-                friend_label = target.get("name") or friend_sid
+                return self._friend_confirm_required(
+                    friend, text, target,
+                    f"「{friend}」没有精确同名好友，仅子串匹配到「{target.get('name') or target['steam_id']}」"
+                    f"（{target['steam_id']}）。",
+                    warnings,
+                )
         try:
             result = await asyncio.to_thread(steam.send_friend_message, cookie, sid, friend_sid, text)
         except (OSError, ValueError) as exc:
@@ -501,13 +572,13 @@ class SteamManagerPlugin(NekoPluginBase):
                 "error": "SEND_FAILED",
             }
         warning = ""
-        if friend_errors:
-            warning = f"\n⚠ 好友概要部分失败（{len(friend_errors)} 批），可能未覆盖全部好友；本次目标已由唯一匹配确定。"
+        if warnings:
+            warning = f"\n⚠ 好友概要部分失败（{len(warnings)} 批），可能未覆盖全部好友；本次目标已由唯一匹配确定。"
         return {
             "output": f"已发送给「{friend_label}」（{friend_sid}）。{warning}",
             "is_error": False,
-            "partial": bool(friend_errors),
-            "warnings": friend_errors,
+            "partial": bool(warnings),
+            "warnings": warnings,
             "result": result,
         }
 
@@ -600,32 +671,43 @@ class SteamManagerPlugin(NekoPluginBase):
         description=(
             "打开任意 Steam 游戏/应用（含其他开发者制作、未安装的游戏）。何时用：用户说'打开/启动 XX 游戏/应用'，"
             "且该游戏不在本地库或想打开商店页时。参数 game：游戏名称或 AppID。"
-            "已安装 → 直接启动；未安装 → 先返回商店候选，确认后带 confirm=true 才会打开商店页。"
+            "已安装 → 直接启动；未安装 → 先返回商店候选和一次性 confirm_token，确认后回传令牌才打开商店页。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "game": {"type": "string", "description": "游戏名称或 AppID"},
-                "confirm": {"type": "boolean", "description": "未安装游戏打开商店页前，用户确认后传 true"},
+                "confirm_token": {"type": "string", "description": "未安装游戏返回的一次性确认令牌"},
             },
             "required": ["game"],
         },
         timeout=30.0,
     )
-    async def steam_open_app(self, *, game: str = "", confirm: bool = False, **_):
+    async def steam_open_app(self, *, game: str = "", confirm_token: str = "", **_):
         _y = self._civ6_ops_yield()
         if _y:
             return _y
         params = _.get("parameters") or {}
         game = (game or params.get("game") or "").strip()
-        confirm = bool(params.get("confirm", confirm))
+        confirm_token = str(confirm_token or params.get("confirm_token") or "").strip()
         if not game:
             return {"output": "请提供要打开的游戏名称或 AppID。", "is_error": True, "error": "NO_GAME"}
         path = self._steam_path or await asyncio.to_thread(steam.find_steam_path)
         app_id = game if game.isdigit() else ""
         store_name = game
         installed = False
-        if path:
+        pending = None
+        if confirm_token:
+            pending = self._consume_confirm(confirm_token, "open_app", game=game)
+            if not pending:
+                return {
+                    "output": "确认令牌无效、已过期，或与本次游戏不匹配。请重新发起确认。",
+                    "is_error": True,
+                    "error": "CONFIRM_TOKEN_INVALID",
+                }
+            app_id = pending["app_id"]
+            store_name = pending.get("name") or game
+        if path and not pending:
             # find_game 内部全量扫描后再过滤；不要用固定 200 条截断，库大时会漏装并误开商店页。
             matches = await asyncio.to_thread(steam.find_game, path, game, 0)
             installed_matches = [g for g in matches if g["installed"]]
@@ -647,7 +729,7 @@ class SteamManagerPlugin(NekoPluginBase):
                     return {"output": f"在 Steam 商店未搜到「{game}」，无法打开。", "is_error": True, "error": "NOT_FOUND"}
                 app_id = results[0]["app_id"]
                 store_name = results[0].get("name") or game
-        elif not app_id:
+        elif not app_id and not pending:
             try:
                 results = await asyncio.to_thread(steam.search_store, game, 1)
             except (OSError, ValueError) as exc:
@@ -658,11 +740,16 @@ class SteamManagerPlugin(NekoPluginBase):
             store_name = results[0].get("name") or game
         if not app_id:
             return {"output": "未能确定 AppID。", "is_error": True, "error": "NO_APP_ID"}
-        if not installed and not confirm:
+        if not installed and not pending:
+            token = self._issue_confirm("open_app", game=game, app_id=app_id, name=store_name)
             return {
-                "output": f"「{game}」未安装，商店候选为「{store_name}」（AppID {app_id}）。确认打开这个商店页请带 confirm=true。",
+                "output": (
+                    f"「{game}」未安装，商店候选为「{store_name}」（AppID {app_id}）。"
+                    "确认打开这个商店页请回传 confirm_token（5 分钟内有效，仅一次）。"
+                ),
                 "is_error": True,
                 "error": "CONFIRM_REQUIRED",
+                "confirm_token": token,
                 "result": {"app_id": app_id, "name": store_name},
             }
         result = await asyncio.to_thread(steam.open_app, path, app_id, installed)
@@ -701,6 +788,18 @@ class SteamManagerPlugin(NekoPluginBase):
         mode = (mode or params.get("mode") or "auto").strip().lower()
         api_key = (api_key or params.get("api_key") or "").strip()
         cookie = (cookie or params.get("cookie") or "").strip()
+        if mode not in ("skip", "yui", "auto"):
+            return {
+                "output": "未知的 mode。只支持 skip / yui / auto；如要保存凭证请用 mode=yui。",
+                "is_error": True,
+                "error": "INVALID_MODE",
+            }
+        if mode == "skip" and (api_key or cookie):
+            return {
+                "output": "mode=skip 会忽略传入的 Key/Cookie，本次未写入任何凭证。要保存请改 mode=yui。",
+                "is_error": True,
+                "error": "MODE_CONFLICT",
+            }
         status = await asyncio.to_thread(steam.credentials_status)
         if mode == "skip":
             return {
@@ -893,7 +992,7 @@ class SteamManagerPlugin(NekoPluginBase):
         if _y:
             return _y
         params = _.get("parameters") or {}
-        on = bool(params.get("on", on))
+        on = _as_bool(params.get("on", on))
         try:
             interval = int(interval or params.get("interval") or 3)
         except (TypeError, ValueError):
@@ -965,7 +1064,7 @@ class SteamManagerPlugin(NekoPluginBase):
         if _y:
             return _y
         params = _.get("parameters") or {}
-        on = bool(params.get("on", on))
+        on = _as_bool(params.get("on", on))
         if not on:
             self._state.disable_control()
             return {"output": "已交还控制，YUI 不再模拟键鼠操作游戏。", "is_error": False}
@@ -1086,6 +1185,7 @@ class SteamManagerPlugin(NekoPluginBase):
                 "mode": {"type": "string", "description": "action=setup 的凭证配置模式：skip / yui / auto"},
                 "api_key": {"type": "string", "description": "action=setup 时要写入并验证的 Steam Web API Key"},
                 "cookie": {"type": "string", "description": "action=setup 时要写入并验证的 steamcommunity Cookie"},
+                "confirm_token": {"type": "string", "description": "action=reply/open 的 CONFIRM_REQUIRED 一次性令牌"},
             },
         },
         timeout=30.0,
@@ -1099,7 +1199,7 @@ class SteamManagerPlugin(NekoPluginBase):
             limit = int(kwargs.get("limit") or params.get("limit") or 0)
         except (TypeError, ValueError):
             limit = 0
-        on = bool(kwargs.get("on", params.get("on", False)))
+        on = _as_bool(kwargs.get("on", params.get("on", False)))
         try:
             interval = int(kwargs.get("interval") or params.get("interval") or 0)
         except (TypeError, ValueError):
@@ -1115,6 +1215,7 @@ class SteamManagerPlugin(NekoPluginBase):
         name_filter = str(kwargs.get("name_filter") or params.get("name_filter") or "")
         friend = str(kwargs.get("friend") or params.get("friend") or "")
         text = str(kwargs.get("text") or params.get("text") or "")
+        confirm_token = str(kwargs.get("confirm_token") or params.get("confirm_token") or "")
         if action in ("status", ""):
             return await self.steam_status()
         if action in ("list", "games"):
@@ -1126,7 +1227,7 @@ class SteamManagerPlugin(NekoPluginBase):
         if action in ("friends", "friendlist"):
             return await self.steam_friends(steam_id=steam_id, name_filter=name_filter, parameters={})
         if action in ("reply", "message"):
-            return await self.steam_reply_friend(friend=friend, text=text, parameters={})
+            return await self.steam_reply_friend(friend=friend, text=text, confirm_token=confirm_token, parameters={})
         if action in ("price", "pricing"):
             return await self.steam_game_price(game=game, parameters={})
         if action in ("setup", "credentials", "config"):
@@ -1139,7 +1240,7 @@ class SteamManagerPlugin(NekoPluginBase):
         if action in ("promo", "promotions", "sale"):
             return await self.steam_promotions(limit=limit, parameters={})
         if action in ("open", "open_app"):
-            return await self.steam_open_app(game=game, parameters={})
+            return await self.steam_open_app(game=game, confirm_token=confirm_token, parameters={})
         if action in ("capture", "screenshot"):
             return await self.game_capture()
         if action in ("watch", "monitor"):
