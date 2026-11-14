@@ -18,6 +18,7 @@ import struct
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 
 _logger = logging.getLogger("N.E.K.O.Plugin_steam_manager.control")
@@ -155,9 +156,24 @@ def _set_sig(fn, argtypes, restype):
 def _configure_win32() -> None:
     """显式声明 Win32 签名。64 位下默认 c_int 返回值会把 HWND/HDC 句柄截断成 32 位。"""
     if USER32 is not None:
+        # 进程级 DPI awareness：不声明时高分屏下 GetWindowRect/鼠标坐标会被系统虚拟化缩放，
+        # 截图尺寸与实际点击位置错位（v0.4.6）。
+        for name, value in (("SetProcessDpiAwarenessContext", -4), ("SetProcessDPIAware", None)):
+            fn = getattr(USER32, name, None)
+            if fn is not None:
+                try:
+                    if value is None:
+                        fn()
+                    else:
+                        fn(ctypes.c_void_p(value))
+                    break
+                except (OSError, AttributeError, ctypes.ArgumentError):
+                    continue
         _set_sig(USER32.GetForegroundWindow, [], wt.HWND)
         _set_sig(USER32.GetWindowTextW, [wt.HWND, wt.LPWSTR, ctypes.c_int], ctypes.c_int)
-        _set_sig(USER32.GetWindowRect, [wt.HWND, ctypes.POINTER(_Rect)], wt.BOOL)
+        # RECT 指针用 c_void_p：模块被重复加载时 POINTER(_Rect) 会绑定到旧类，
+        # 传 byref(新 _Rect()) 反而报 LP__Rect 类型不匹配。
+        _set_sig(USER32.GetWindowRect, [wt.HWND, ctypes.c_void_p], wt.BOOL)
         _set_sig(USER32.GetWindowLongW, [wt.HWND, ctypes.c_int], ctypes.c_long)
         _set_sig(USER32.GetWindowThreadProcessId, [wt.HWND, ctypes.POINTER(wt.DWORD)], wt.DWORD)
         _set_sig(USER32.EnumWindows, [_WNDENUMPROC, wt.LPARAM], wt.BOOL)
@@ -290,8 +306,17 @@ def capture_window_bmp(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
     width = max(1, right - left)
     height = max(1, bottom - top)
     hdc_screen = USER32.GetDC(None)
+    if not hdc_screen:
+        return None
     hdc_mem = GDI32.CreateCompatibleDC(hdc_screen)
+    if not hdc_mem:
+        USER32.ReleaseDC(None, hdc_screen)
+        return None
     hbmp = GDI32.CreateCompatibleBitmap(hdc_screen, width, height)
+    if not hbmp:
+        GDI32.DeleteDC(hdc_mem)
+        USER32.ReleaseDC(None, hdc_screen)
+        return None
     old = GDI32.SelectObject(hdc_mem, hbmp)
     ok = GDI32.BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, left, top, 0x00CC0020)
     if not ok:
@@ -310,11 +335,16 @@ def capture_window_bmp(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
     bmi.bmiHeader.biCompression = _BI_RGB
     row_size = (width * 4 + 3) & ~3
     buf = ctypes.create_string_buffer(row_size * height)
-    GDI32.GetDIBits(hdc_mem, hbmp, 0, height, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(bmi), 0)
+    copied = GDI32.GetDIBits(
+        hdc_mem, hbmp, 0, height, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(bmi), 0
+    )
     GDI32.SelectObject(hdc_mem, old)
     GDI32.DeleteObject(hbmp)
     GDI32.DeleteDC(hdc_mem)
     USER32.ReleaseDC(None, hdc_screen)
+    if copied != height:
+        _logger.warning("GetDIBits 只复制了 %s/%s 行，放弃本帧", copied, height)
+        return None
     return _write_png(save_dir, width, height, buf.raw)
 
 
@@ -330,7 +360,7 @@ def _write_png(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str
 
         os.makedirs(save_dir, exist_ok=True)
         img = Image.frombytes("RGBA", (width, height), dib_pixels, "raw", "BGRA").convert("RGB")
-        path = os.path.join(save_dir, f"frame_{int(time.time() * 1000)}.png")
+        path = os.path.join(save_dir, f"frame_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.png")
         img.save(path, "PNG")
         cleanup_old_frames(save_dir)
         return path
@@ -348,11 +378,15 @@ def _write_bmp(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str
     header += b"BM"
     header += struct.pack("<IHHI", file_size, 0, 0, 54)
     header += struct.pack("<IiiHHIIiiII", 40, width, height, 1, 32, 0, data_size, 0, 0, 0, 0)
-    # 32bit BGRA：每像素 4 字节，行宽天然 4 字节对齐，DIB 数据直接落盘即可合法
-    path = os.path.join(save_dir, f"frame_{int(time.time() * 1000)}.bmp")
+    # DIB 是自上而下，BMP 正高度要求自下而上：逐行倒序写入，避免回退图上下颠倒。
+    rows = [
+        dib_pixels[row * row_size:(row + 1) * row_size]
+        for row in range(height - 1, -1, -1)
+    ]
+    path = os.path.join(save_dir, f"frame_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.bmp")
     try:
         with open(path, "wb") as fh:
-            fh.write(bytes(header) + dib_pixels[:data_size])
+            fh.write(bytes(header) + b"".join(rows))
     except OSError as exc:
         _logger.warning("BMP 写入失败：%s", exc)
         return None
@@ -511,8 +545,8 @@ def mouse_click_abs(screen_x: int, screen_y: int) -> None:
 
 
 def press_key(vk: int) -> None:
-    """按下并抬起一个虚拟键；非 Windows 为 no-op。"""
-    if USER32 is None:
+    """按下并抬起一个虚拟键；非 Windows 或非法键码为 no-op。"""
+    if USER32 is None or not isinstance(vk, int) or not (1 <= vk <= 255):
         return
     extra = ctypes.c_size_t(0)
     USER32.keybd_event(vk, 0, 0, extra)
@@ -583,6 +617,7 @@ class ControlState:
         self.watch_enabled = False
         self.control_enabled = False
         self.last_window: dict | None = None
+        self.control_target: dict | None = None
         self.frames: deque = deque(maxlen=max_frames)
         self.timeline: deque = deque(maxlen=max_timeline)
         self._lock = threading.RLock()
@@ -598,7 +633,8 @@ class ControlState:
             self.last_window = info
             self.frames.append(
                 {"ts": info.get("ts", time.time()), "path": path, "title": info.get("title", ""),
-                 "pid": info.get("pid", 0), "process": info.get("process", "")}
+                 "pid": info.get("pid", 0), "hwnd": info.get("hwnd", 0),
+                 "process": info.get("process", "")}
             )
 
     # ── 开关 ──
@@ -615,11 +651,14 @@ class ControlState:
                 self.watch_enabled = False
                 self.note_event("watch_stop", "后台画面监控已关闭")
 
-    def enable_control(self) -> bool:
-        """开启接管。要求：窗口在场且有最近帧证据。"""
+    def enable_control(self, target: dict | None = None) -> bool:
+        """开启接管。要求：目标窗口已绑定，且该窗口在 30 秒内有帧证据。"""
         with self._lock:
-            if not self.recent_window_active(within_seconds=30):
+            if not target or not target.get("hwnd"):
                 return False
+            if not self.recent_window_active(target, within_seconds=30):
+                return False
+            self.control_target = dict(target)
             if not self.control_enabled:
                 self.control_enabled = True
                 self.note_event("control_on", "YUI 接管已授权（键鼠模拟）")
@@ -630,15 +669,34 @@ class ControlState:
             if self.control_enabled:
                 self.control_enabled = False
                 self.note_event("control_off", "YUI 接管已交还")
+            self.control_target = None
 
     # ── 查询 ──
 
-    def recent_window_active(self, within_seconds: float = 10.0) -> bool:
+    def recent_window_active(
+        self, target: dict | None = None, within_seconds: float = 10.0
+    ) -> bool:
         with self._lock:
             if not self.frames:
                 return False
-            latest = self.frames[-1].get("ts", 0)
+            if target and target.get("hwnd"):
+                hwnd = target.get("hwnd")
+                latest = max(
+                    (f.get("ts", 0) for f in self.frames if f.get("hwnd") == hwnd),
+                    default=0,
+                )
+            else:
+                latest = self.frames[-1].get("ts", 0)
             return (time.time() - latest) <= within_seconds
+
+    @staticmethod
+    def target_matches(target: dict | None, info: dict | None) -> bool:
+        """目标窗口是否仍是同一个窗口/进程（hwnd 优先，退化到 pid+标题）。"""
+        if not target or not info:
+            return False
+        if target.get("hwnd") and info.get("hwnd"):
+            return target["hwnd"] == info["hwnd"]
+        return bool(target.get("pid")) and target.get("pid") == info.get("pid")
 
     def summary(self) -> dict:
         with self._lock:
@@ -646,6 +704,7 @@ class ControlState:
                 "watch_enabled": self.watch_enabled,
                 "control_enabled": self.control_enabled,
                 "last_window": dict(self.last_window) if self.last_window else None,
+                "control_target": dict(self.control_target) if self.control_target else None,
                 "frames": [dict(f) for f in self.frames],
                 "timeline": [dict(t) for t in self.timeline],
             }
@@ -687,28 +746,65 @@ def cleanup_old_frames(save_dir: str | None = None, keep: int = _MAX_FRAME_FILES
     return removed
 
 
-class FrameWatcher:
-    """周期截取前台窗口画面的后台线程。"""
+_NON_GAME_PROCESSES = {
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "steamwebhelper.exe", "steam.exe", "explorer.exe", "cmd.exe",
+    "powershell.exe", "pwsh.exe", "windowsterminal.exe", "conhost.exe",
+    "code.exe", "notepad.exe",
+}
 
-    def __init__(self, state: ControlState, interval: float = 3.0) -> None:
+
+def is_game_like(info: dict | None) -> bool:
+    """标题可伪造，进程名是硬边界；浏览器/终端/资源管理器不算游戏窗口。"""
+    if not info:
+        return False
+    return str(info.get("process") or "").strip().casefold() not in _NON_GAME_PROCESSES
+
+
+class FrameWatcher:
+    """周期截取目标游戏窗口画面的后台线程。
+
+    v0.4.6：同一进程只允许一个监控线程（类级锁/活动实例），并绑定窗口标题；
+    绑定了目标时只记录目标窗口，前台是别的窗口时用 PrintWindow 抓目标本体，
+    避免把浏览器/终端画面当成游戏帧，也避免点击落到上层窗口。
+    """
+
+    _GLOBAL_LOCK = threading.Lock()
+    _ACTIVE: "FrameWatcher | None" = None
+
+    def __init__(self, state: ControlState, interval: float = 3.0, title_hint: str = "") -> None:
         self._state = state
         self._interval = max(_MIN_INTERVAL, float(interval))
+        self._title_hint = (title_hint or "").strip()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lifecycle = threading.Lock()
 
     def start(self) -> None:
         with self._lifecycle:
-            if self._thread and self._thread.is_alive():
-                if self._stop.is_set():
-                    # 上一次 stop 超时但线程仍在收尾：等它真正退出，绝不并发第二个线程。
-                    self._thread.join(timeout=2.0)
+            with FrameWatcher._GLOBAL_LOCK:
+                active = FrameWatcher._ACTIVE
+                if active is not None and active is not self:
+                    active._stop.set()
+                    if active._thread:
+                        active._thread.join(timeout=2.0)
+                    if active._thread and active._thread.is_alive():
+                        _logger.warning("另一个帧监控线程尚未退出，拒绝启动新的监控线程")
+                        return
+                    FrameWatcher._ACTIVE = None
                 if self._thread and self._thread.is_alive():
-                    _logger.warning("上一帧监控线程尚未退出，拒绝启动第二个线程")
-                    return
-            self._stop.clear()
-            self._thread = threading.Thread(target=self._loop, name="steam-manager-watcher", daemon=True)
-            self._thread.start()
+                    if self._stop.is_set():
+                        # 上一次 stop 超时但线程仍在收尾：等它真正退出，绝不并发第二个线程。
+                        self._thread.join(timeout=2.0)
+                    if self._thread and self._thread.is_alive():
+                        _logger.warning("上一帧监控线程尚未退出，拒绝启动第二个线程")
+                        return
+                self._stop.clear()
+                self._thread = threading.Thread(
+                    target=self._loop, name="steam-manager-watcher", daemon=True
+                )
+                self._thread.start()
+                FrameWatcher._ACTIVE = self
 
     def stop(self) -> None:
         with self._lifecycle:
@@ -719,16 +815,35 @@ class FrameWatcher:
                     _logger.warning("帧监控线程 2s 内未退出，保留引用等待下次 stop/start")
                 else:
                     self._thread = None
+            with FrameWatcher._GLOBAL_LOCK:
+                if FrameWatcher._ACTIVE is self:
+                    FrameWatcher._ACTIVE = None
+
+    def _target(self) -> dict | None:
+        if self._title_hint:
+            return find_window_by_title(self._title_hint)
+        return get_foreground_window_info()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                info = get_foreground_window_info()
-                if info:
-                    path = capture_window_bmp(info)
+                target = self._target()
+                if target and not is_game_like(target):
+                    # 标题命中的是浏览器/终端：不记帧、不截图，避免把网页当游戏画面。
+                    target = None
+                if target:
+                    fg = get_foreground_window_info()
+                    same_window = ControlState.target_matches(target, fg)
+                    if same_window:
+                        path = capture_window_bmp(target)
+                    else:
+                        # 目标被遮挡/在后台：PrintWindow 只抓目标窗口本体。
+                        path = capture_window_printwindow(target)
                     if path:
-                        self._state.note_frame(info, path)
-                        self._state.note_event("frame", f"{info.get('title', '')} / {info.get('process', '')}")
+                        self._state.note_frame(target, path)
+                        self._state.note_event(
+                            "frame", f"{target.get('title', '')} / {target.get('process', '')}"
+                        )
                 self._cleanup_old_frames()
             except Exception as exc:  # 后台线程不能因单帧异常退出
                 _logger.warning("帧监控循环异常：%s", exc)

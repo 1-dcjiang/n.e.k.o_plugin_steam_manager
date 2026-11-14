@@ -52,12 +52,13 @@ def test_control_requires_window_evidence() -> None:
     from plugin.plugins.steam_manager.control import ControlState
 
     state = ControlState()
+    target = _fake_window(ts=time.time())
     # 无任何帧 → 拒绝开启接管
-    assert state.enable_control() is False
+    assert state.enable_control(target) is False
     assert state.control_enabled is False
-    # 有最近帧 → 允许开启
-    state.note_frame(_fake_window(ts=time.time()), r"C:\tmp\frame.bmp")
-    assert state.enable_control() is True
+    # 有目标窗口的最近帧 → 允许开启
+    state.note_frame(target, r"C:\tmp\frame.bmp")
+    assert state.enable_control(target) is True
     assert state.control_enabled is True
     # 交还
     state.disable_control()
@@ -70,7 +71,7 @@ def test_control_rejected_with_stale_frame() -> None:
     state = ControlState()
     stale = _fake_window(ts=time.time() - 3600)
     state.note_frame(stale, r"C:\tmp\old.bmp")
-    assert state.enable_control() is False
+    assert state.enable_control(stale) is False
 
 
 def test_recent_window_active() -> None:

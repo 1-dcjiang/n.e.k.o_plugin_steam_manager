@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -50,6 +51,11 @@ _FALLBACK_PATHS = (
 # StateFlags 位含义（Steam 官方）
 _FLAG_FULLY_INSTALLED = 4  # 已完整安装
 _FLAG_UPDATE_REQUIRED = 2  # 需要更新
+
+
+def _is_ascii_digits(value: object) -> bool:
+    text = str(value or "")
+    return text.isascii() and text.isdigit()
 
 
 def _state_flags_text(flags: int) -> str:
@@ -172,7 +178,7 @@ def scan_games(steam_path: str, limit: int = 100) -> list[dict]:
             if not (filename.startswith("appmanifest_") and filename.endswith(".acf")):
                 continue
             app_id = filename[len("appmanifest_"):-len(".acf")]
-            if not app_id.isdigit() or app_id in seen:
+            if not _is_ascii_digits(app_id) or app_id in seen:
                 continue
             seen.add(app_id)
             acf_path = os.path.join(apps_dir, filename)
@@ -201,9 +207,8 @@ def scan_games(steam_path: str, limit: int = 100) -> list[dict]:
                     "state": _state_flags_text(flags),
                 }
             )
-            if limit > 0 and len(games) >= limit:
-                return games
-    return games
+            # 不在这里 return：多库安装时提前截断只覆盖第一个库，后面的库全漏。
+    return games[:limit] if limit > 0 else games
 
 
 def find_game(steam_path: str, query: str, limit: int = 100) -> list[dict]:
@@ -274,7 +279,7 @@ def launch_game(steam_path: str, app_id: str) -> dict:
     返回 {"ok": bool, ...} 信封；steam.exe 不存在时给出明确错误。
     """
     app_id = (app_id or "").strip()
-    if not app_id.isdigit() or len(app_id) > 10:
+    if not _is_ascii_digits(app_id) or len(app_id) > 10:
         return {"ok": False, "error": "INVALID_APP_ID", "output": "AppID 必须是 1-10 位数字。"}
     if not steam_path or not os.path.isabs(steam_path):
         return {"ok": False, "error": "STEAM_NOT_FOUND", "output": "Steam 路径无效，无法启动游戏。"}
@@ -436,14 +441,24 @@ def _write_secret_file(path: str, value: str) -> None:
         payload = _CREDENTIAL_MARKER + base64.b64encode(cipher).decode("ascii")
     else:
         payload = value
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(payload)
+    fd, tmp = tempfile.mkstemp(
+        dir=directory, prefix=os.path.basename(path) + ".", suffix=".tmp"
+    )
+    os.close(fd)
     try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(payload)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _read_credential(name: str) -> str:
@@ -496,6 +511,19 @@ def _cookie_value(cookie_text: str, name: str) -> str:
         part = part.strip()
         if part.startswith(name + "="):
             return part[len(name) + 1:].strip().strip('"')
+    return ""
+
+
+def _cookie_steam_id(cookie_text: str) -> str:
+    """从 steamLoginSecure/steamLogin 里取 cookie 本人的 SteamID（格式 sid||token）。"""
+    for name in ("steamLoginSecure", "steamLogin"):
+        raw = _cookie_value(cookie_text, name)
+        if not raw:
+            continue
+        value = urllib.parse.unquote(raw).strip('"')
+        sid = value.split("|", 1)[0].strip()
+        if _is_ascii_digits(sid) and len(sid) == 17:
+            return sid
     return ""
 
 
@@ -554,17 +582,36 @@ def validate_api_key(key: str) -> tuple[bool, str]:
 
 
 def _probe_cookie_page(cookie: str) -> tuple[str, str]:
-    """带 Cookie 请求 steamcommunity /profiles/me，返回 (最终URL, 页面文本)。"""
+    """带 Cookie 请求 steamcommunity /my/profile，返回 (最终URL, 页面文本)。
+
+    用 /my/profile 而不是 /profiles/me：未登录时 /profiles/me 本身就含
+    ``/profiles/``，只检查 URL 子串会把登录页误判成已登录。
+    """
     req = urllib.request.Request(
-        "https://steamcommunity.com/profiles/me",
+        "https://steamcommunity.com/my/profile",
         headers={"User-Agent": _UA, "Cookie": cookie},
     )
-    with urllib.request.urlopen(req, timeout=15.0) as resp:
+    with urllib.request.urlopen(req, timeout=8.0) as resp:
         return resp.geturl(), resp.read(65536).decode("utf-8", errors="replace")
 
 
+def _is_profile_url(final_url: str) -> bool:
+    """最终 URL 必须是 /profiles/<数字> 或 /id/<自定义名>，不能是 /login 或 /profiles/me。"""
+    try:
+        path = urllib.parse.urlsplit(final_url).path.rstrip("/")
+    except ValueError:
+        return False
+    if path in ("", "/", "/profiles/me", "/login", "/login/home"):
+        return False
+    if path.startswith("/profiles/"):
+        return _is_ascii_digits(path.rsplit("/", 1)[-1])
+    if path.startswith("/id/"):
+        return len(path.rsplit("/", 1)[-1]) > 0
+    return False
+
+
 def validate_community_cookie(cookie: str) -> tuple[bool, str]:
-    """验证 steamcommunity Cookie：跳转到个人资料页或页面含身份信息 = 有效。
+    """验证 steamcommunity Cookie：最终落到真实个人资料页且页面含身份字段。
 
     需含 sessionid（发消息必需）。返回 (是否有效, 说明)。
     """
@@ -579,9 +626,12 @@ def validate_community_cookie(cookie: str) -> tuple[bool, str]:
         return False, f"验证请求失败（HTTP {exc.code}）"
     except OSError as exc:
         return False, f"验证请求失败：{redact_text(exc)}"
-    if "/profiles/" in final_url or "personaName" in body or '"steamid"' in body:
-        return True, "Cookie 有效（已通过 steamcommunity 登录态验证）"
-    return False, "Cookie 无效或已过期（未登录到个人资料页）"
+    if not _is_profile_url(final_url):
+        return False, "Cookie 无效或已过期（请求被重定向到登录页/不是个人资料页）"
+    has_identity = "personaName" in body and ('"steamid"' in body or "g_rgProfileData" in body)
+    if not has_identity:
+        return False, "Cookie 无效或已过期（个人资料页未返回身份字段，可能只拿到了公开页）"
+    return True, "Cookie 有效（已落到个人资料页并读到身份字段）"
 
 
 def credentials_status() -> dict:
@@ -681,12 +731,15 @@ def _retry_after_seconds(headers) -> float:
 def _http_get_json(
     url: str,
     referer: str | None = None,
-    timeout: float = 15.0,
-    retries: int = 2,
+    timeout: float = 6.0,
+    retries: int = 1,
     sleep_fn=None,
+    total_budget: float = 20.0,
 ) -> dict:
     """GET 并解析 JSON；429/5xx 有限次退避重试，并遵守 Retry-After。
 
+    v0.4.6：总预算 total_budget（含重试与退避）封顶 20s，保证单个工具的 30s
+    timeout 内能返回；此前 15s×3 次 + 退避最坏超过 45s，工具会先被宿主杀掉。
     sleep_fn 仅用于测试注入，避免 monkeypatch 全进程 stdlib time.sleep。
     """
     headers = {
@@ -698,14 +751,22 @@ def _http_get_json(
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
     attempt = 0
+    deadline = time.monotonic() + max(1.0, float(total_budget))
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            raise SteamHTTPError(408, f"请求超出 {total_budget:g}s 总预算")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=min(timeout, remaining)) as resp:
                 raw = resp.read()
             return json.loads(raw)
         except urllib.error.HTTPError as exc:
             if exc.code in _RETRYABLE_STATUS and attempt < retries:
-                delay = _retry_after_seconds(exc.headers) or min(4.0, 2.0 ** attempt)
+                delay = _retry_after_seconds(exc.headers) or min(2.0, 1.0 + attempt)
+                if delay >= deadline - time.monotonic():
+                    _logger.warning("GET %s -> HTTP %s，退避 %.1fs 会超出总预算，放弃重试",
+                                    _safe_url(url), exc.code, delay)
+                    raise SteamHTTPError(exc.code, str(exc.reason or "")) from exc
                 _logger.warning(
                     "GET %s -> HTTP %s，%.1fs 后重试（%d/%d）",
                     _safe_url(url), exc.code, delay, attempt + 1, retries,
@@ -799,7 +860,8 @@ def friend_list(
     ids = [str(f.get("steamid") or "") for f in friends if f.get("steamid")]
     info_map = _summaries_in_chunks(api_key, ids, errors=errors)
     out: list[dict] = []
-    for f in friends[:limit]:
+    selected = friends if limit <= 0 else friends[:limit]
+    for f in selected:
         sid = str(f.get("steamid") or "")
         if not sid:
             continue
@@ -842,11 +904,17 @@ def send_friend_message(cookie: str, my_steam_id: str, friend_steam_id: str, tex
     session = _cookie_value(cookie, "sessionid")
     if not session:
         raise ValueError("cookie 缺少 sessionid（请重新登录 steamcommunity 后更新 steam_cookie.txt）")
+    cookie_sid = _cookie_steam_id(cookie)
+    if not cookie_sid:
+        raise ValueError("cookie 缺少身份字段 steamLoginSecure/steamLogin，无法核对发送方身份")
+    if cookie_sid != my_steam_id:
+        raise ValueError("Cookie 属于另一个账号，与当前本地 SteamID 不一致，拒绝发送")
     body = urllib.parse.urlencode(
         {
             "steamid_first": friend_steam_id,
             "steamid": my_steam_id,
             "body": text,
+            "sessionid": session,  # v0.4.6：网页聊天接口需要 sessionid 绑定登录会话
         }
     ).encode()
     req = urllib.request.Request(
@@ -928,7 +996,7 @@ def search_store(query: str, limit: int = 5) -> list[dict]:
 def app_price(appid: str) -> dict | None:
     """查询单个 AppID 的国区价格与折扣。返回 None 表示不存在或不可用。"""
     appid = (appid or "").strip()
-    if not appid.isdigit():
+    if not _is_ascii_digits(appid):
         return None
     url = (
         "https://store.steampowered.com/api/appdetails"
@@ -946,7 +1014,8 @@ def app_price(appid: str) -> dict | None:
         original = int(po.get("original")) if po.get("original") is not None else None
     except (TypeError, ValueError):
         original = None
-    free = bool(po.get("is_free")) or final is None
+    # Steam 的免费标记可能在 data 顶层（无 price_overview）或 price_overview 里。
+    free = bool(d.get("is_free") or po.get("is_free"))
     return {
         "app_id": appid,
         "name": str(d.get("name") or ""),
@@ -954,6 +1023,7 @@ def app_price(appid: str) -> dict | None:
         "original_cny": (original / 100) if original is not None else None,
         "discount": int(po.get("discount_percent") or 0) if po.get("discount_percent") is not None else 0,
         "free": free,
+        "price_known": free or (bool(po) and final is not None),
     }
 
 
@@ -991,7 +1061,7 @@ def open_app(steam_path: str | None, app_id: str, installed: bool) -> dict:
     用于打开其他开发者制作/未安装的游戏或应用。
     """
     app_id = (app_id or "").strip()
-    if not app_id.isdigit():
+    if not _is_ascii_digits(app_id):
         return {"ok": False, "error": "INVALID_APP_ID", "output": "AppID 必须是数字。"}
     if installed:
         if not steam_path:

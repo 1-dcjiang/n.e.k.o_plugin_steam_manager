@@ -365,10 +365,25 @@ def test_validate_api_key_forbidden(monkeypatch) -> None:
 def test_validate_community_cookie_ok(monkeypatch) -> None:
     from plugin.plugins.steam_manager import steam
 
-    monkeypatch.setattr(steam, "_probe_cookie_page", lambda cookie: ("https://steamcommunity.com/profiles/76561198", '<div class="personaName">x</div>'))
+    monkeypatch.setattr(steam, "_probe_cookie_page", lambda cookie: (
+        "https://steamcommunity.com/profiles/76561198000000001",
+        '<div class="personaName">x</div><script>g_rgProfileData = {"steamid":"76561198000000001"}</script>',
+    ))
     ok, msg = steam.validate_community_cookie("sessionid=abc; steamLoginSecure=xyz")
     assert ok is True
     assert "有效" in msg
+
+
+def test_validate_community_cookie_rejects_profiles_me(monkeypatch) -> None:
+    """未登录时 /profiles/me 自身就含 /profiles/，不能因此判为已登录。"""
+    from plugin.plugins.steam_manager import steam
+
+    monkeypatch.setattr(steam, "_probe_cookie_page", lambda cookie: (
+        "https://steamcommunity.com/profiles/me", "<html>login</html>"
+    ))
+    ok, msg = steam.validate_community_cookie("sessionid=abc; steamLoginSecure=xyz")
+    assert ok is False
+    assert "无效或已过期" in msg
 
 
 def test_validate_community_cookie_missing_session(monkeypatch) -> None:
