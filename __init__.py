@@ -1,4 +1,4 @@
-"""steam_manager — Steam 管理 + 游戏助手（v0.4.2）。
+"""steam_manager — Steam 管理 + 游戏助手（v0.4.3）。
 
 安全边界：只读本地库元数据；启动游戏需用户明确指令；截图与行为跟踪
 仅在用户开启监控后运行；键鼠接管（YUI 操作游戏）默认关闭，必须由
@@ -410,28 +410,70 @@ class SteamManagerPlugin(NekoPluginBase):
         sid = await self._steam_id("")
         if not sid:
             return {"output": "未读取到本地 SteamID（需先登录 Steam 客户端，用于确认发消息人身份）。", "is_error": True, "error": "NO_STEAM_ID"}
-        friend_sid = friend if friend.isdigit() else ""
+        friend_sid = ""
+        friend_label = friend
+        if not key:
+            # 没有 API Key 就无法把昵称解析成 SteamID；只接受明确的 17 位 SteamID，避免纯数字昵称被误当 ID。
+            if friend.isdigit() and len(friend) == 17:
+                friend_sid = friend
+            else:
+                return {
+                    "output": "按昵称发送需要 STEAM_API_KEY（用于解析昵称）；没有 Key 时请提供 17 位 SteamID。",
+                    "is_error": True,
+                    "error": "NO_API_KEY",
+                }
         if not friend_sid:
-            if not key:
-                return {"output": "要用好友昵称发消息需要 STEAM_API_KEY（用于把昵称解析为 SteamID）。", "is_error": True, "error": "NO_API_KEY"}
             errors: list[str] = []
             try:
-                friends = await asyncio.to_thread(steam.friend_list, key, sid, 200, errors)
+                friends = await asyncio.to_thread(steam.friend_list, key, sid, 10000, errors)
             except (OSError, ValueError) as exc:
                 return {"output": f"好友列表查询失败：{steam.redact_text(exc)}", "is_error": True, "error": "FRIEND_LIST_FAILED"}
-            matches = [f for f in friends if friend.lower() in f["name"].lower()]
-            if not matches:
+            # 精确匹配优先：同名或同 SteamID 才算确定目标；纯数字输入绝不做子串匹配。
+            exact: dict[str, dict] = {}
+            query_fold = friend.casefold()
+            for item in friends:
+                item_sid = item.get("steam_id") or ""
+                if not item_sid:
+                    continue
+                name_fold = (item.get("name") or "").strip().casefold()
+                if item_sid == friend or (name_fold and name_fold == query_fold):
+                    exact[item_sid] = item
+            if len(exact) == 1:
+                target = next(iter(exact.values()))
+                friend_sid = target["steam_id"]
+                friend_label = target.get("name") or friend_sid
+            elif len(exact) > 1:
+                cand = "、".join(f"{f.get('name') or f['steam_id']}（{f['steam_id']}）" for f in list(exact.values())[:8])
+                return {"output": f"「{friend}」同时匹配到多个昵称/SteamID，请明确指定：{cand}", "is_error": True, "error": "AMBIGUOUS"}
+            elif friend.isdigit():
                 extra = "（好友概要部分失败，可能漏匹配）" if errors else ""
-                return {"output": f"在好友列表中没有找到「{friend}」{extra}。可先用 steam_friends 查看好友。", "is_error": True, "error": "NO_FRIEND"}
-            if len(matches) > 1:
-                cand = "、".join(f"{f['name'] or f['steam_id']}（{f['steam_id']}）" for f in matches[:8])
-                return {"output": f"「{friend}」匹配到多个好友，请指定 SteamID：{cand}", "is_error": True, "error": "AMBIGUOUS"}
-            friend_sid = matches[0]["steam_id"]
+                return {
+                    "output": f"数字输入「{friend}」既不是好友 SteamID，也没有同名好友；为避免发错人，不按子串匹配{extra}。可先用 steam_friends 核对。",
+                    "is_error": True,
+                    "error": "NO_FRIEND",
+                }
+            else:
+                matches = [f for f in friends if query_fold in (f.get("name") or "").casefold()]
+                if not matches:
+                    extra = "（好友概要部分失败，可能漏匹配）" if errors else ""
+                    return {"output": f"在好友列表中没有找到「{friend}」{extra}。可先用 steam_friends 查看好友。", "is_error": True, "error": "NO_FRIEND"}
+                if len(matches) > 1:
+                    cand = "、".join(f"{f['name'] or f['steam_id']}（{f['steam_id']}）" for f in matches[:8])
+                    return {"output": f"「{friend}」匹配到多个好友，请指定 SteamID：{cand}", "is_error": True, "error": "AMBIGUOUS"}
+                friend_sid = matches[0]["steam_id"]
+                friend_label = matches[0].get("name") or friend_sid
         try:
             result = await asyncio.to_thread(steam.send_friend_message, cookie, sid, friend_sid, text)
         except (OSError, ValueError) as exc:
-            return {"output": steam.redact_text(exc), "is_error": True, "error": "SEND_FAILED"}
-        return {"output": "已发送。", "is_error": False, "result": result}
+            return {
+                "output": (
+                    f"发送给「{friend_label}」（{friend_sid}）失败：{steam.redact_text(exc)}。"
+                    "请确认 Cookie 未过期、目标 SteamID 正确；必要时重新配置 Cookie 或稍后重试。"
+                ),
+                "is_error": True,
+                "error": "SEND_FAILED",
+            }
+        return {"output": f"已发送给「{friend_label}」（{friend_sid}）。", "is_error": False, "result": result}
 
     @llm_tool(
         name="steam_game_price",
@@ -545,11 +587,8 @@ class SteamManagerPlugin(NekoPluginBase):
         app_id = game if game.isdigit() else ""
         installed = False
         if path:
-            if not app_id:
-                matches = await asyncio.to_thread(steam.find_game, path, game)
-            else:
-                all_games = await asyncio.to_thread(steam.scan_games, path, 200)
-                matches = [g for g in all_games if g["app_id"] == app_id]
+            # find_game 内部全量扫描后再过滤；不要用固定 200 条截断，库大时会漏装并误开商店页。
+            matches = await asyncio.to_thread(steam.find_game, path, game, 0)
             installed_matches = [g for g in matches if g["installed"]]
             if installed_matches:
                 if len(installed_matches) > 1:
@@ -626,19 +665,24 @@ class SteamManagerPlugin(NekoPluginBase):
         problems: list[str] = []
         if api_key:
             try:
-                await asyncio.to_thread(steam.save_api_key, api_key)
+                # 先验证再落盘，避免把无效 Key 写进用户数据目录覆盖原有可用凭证。
                 ok, msg = await asyncio.to_thread(steam.validate_api_key, api_key)
-                saved.append(f"API Key：{'已加密写入并验证通过' if ok else f'已加密写入但验证未通过（{msg}）'}")
-                if not ok:
+                if ok:
+                    await asyncio.to_thread(steam.save_api_key, api_key)
+                    saved.append("API Key：已加密写入并验证通过")
+                else:
+                    saved.append("API Key：验证未通过，未写入")
                     problems.append(msg)
             except ValueError as exc:
                 problems.append(str(exc))
         if cookie:
             try:
-                await asyncio.to_thread(steam.save_community_cookie, cookie)
                 ok, msg = await asyncio.to_thread(steam.validate_community_cookie, cookie)
-                saved.append(f"Cookie：{'已加密写入并验证通过' if ok else f'已加密写入但验证未通过（{msg}）'}")
-                if not ok:
+                if ok:
+                    await asyncio.to_thread(steam.save_community_cookie, cookie)
+                    saved.append("Cookie：已加密写入并验证通过")
+                else:
+                    saved.append("Cookie：验证未通过，未写入")
                     problems.append(msg)
             except ValueError as exc:
                 problems.append(str(exc))

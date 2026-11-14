@@ -139,7 +139,7 @@ def test_credentials_yui_writes_and_verifies(monkeypatch, tmp_path) -> None:
     assert result["is_error"] is True
     assert result["error"] == "CREDENTIAL_INVALID"
     assert "验证未通过" in result["output"]
-    assert written == ["BADKEY"]
+    assert written == []
 
 
 def test_credentials_auto_without_credential_opens_guide(monkeypatch) -> None:
@@ -204,3 +204,105 @@ def test_game_capture_uses_configured_window_title(monkeypatch, tmp_path) -> Non
     assert hints == ["factorio"]
     assert "Factorio 1.1" in result["output"]
     assert result["images"]
+
+
+# ══════════ v0.4.3：好友精确匹配 / 凭证先验后写 / 全库扫描 ══════════
+
+
+def _reply_plugin(monkeypatch):
+    from plugin.plugins.steam_manager import steam
+
+    inst = _plugin()
+
+    async def _sid(_steam_id=""):
+        return "MY-STEAM-ID"
+
+    inst._steam_id = _sid
+    monkeypatch.setattr(steam, "api_key", lambda: "KEY")
+    monkeypatch.setattr(steam, "community_cookie", lambda: "COOKIE")
+    return inst, steam
+
+
+def test_reply_friend_numeric_nickname_exact_match(monkeypatch) -> None:
+    """纯数字昵称只要精确同名，就按昵称发，不再默认当 SteamID。"""
+    inst, steam = _reply_plugin(monkeypatch)
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(steam, "friend_list", lambda *a: [
+        {"steam_id": "76561198000000001", "name": "12345"},
+        {"steam_id": "76561198000000002", "name": "someone"},
+    ])
+    monkeypatch.setattr(steam, "send_friend_message", lambda _c, _s, target, text: sent.append((target, text)) or {"ok": True})
+
+    result = _run(inst.steam_reply_friend(friend="12345", text="hi"))
+    assert result["is_error"] is False
+    assert sent == [("76561198000000001", "hi")]
+
+
+def test_reply_friend_numeric_non_id_rejected_without_substring(monkeypatch) -> None:
+    """纯数字既不等于好友 SteamID、也无同名好友时拒绝，绝不按子串猜人。"""
+    inst, steam = _reply_plugin(monkeypatch)
+    monkeypatch.setattr(steam, "friend_list", lambda *a: [
+        {"steam_id": "76561198000000001", "name": "12345abc"},
+        {"steam_id": "76561198000000002", "name": "76561198000000003"},
+    ])
+    monkeypatch.setattr(steam, "send_friend_message", lambda *a: (_ for _ in ()).throw(AssertionError("不应发送")))
+
+    result = _run(inst.steam_reply_friend(friend="12345", text="hi"))
+    assert result["is_error"] is True
+    assert result["error"] == "NO_FRIEND"
+    assert "不按子串匹配" in result["output"]
+
+
+def test_reply_friend_exact_steam_id_and_ambiguous_nickname(monkeypatch) -> None:
+    inst, steam = _reply_plugin(monkeypatch)
+    friends = [
+        {"steam_id": "76561198000000001", "name": "Same"},
+        {"steam_id": "76561198000000002", "name": "Same"},
+        {"steam_id": "76561198000000003", "name": "Other"},
+    ]
+    monkeypatch.setattr(steam, "friend_list", lambda *a: friends)
+    monkeypatch.setattr(steam, "send_friend_message", lambda *a: {"ok": True})
+
+    ambiguous = _run(inst.steam_reply_friend(friend="Same", text="hi"))
+    assert ambiguous["error"] == "AMBIGUOUS"
+    by_id = _run(inst.steam_reply_friend(friend="76561198000000003", text="hi"))
+    assert by_id["is_error"] is False
+
+
+def test_credentials_cookie_invalid_not_saved(monkeypatch, tmp_path) -> None:
+    from plugin.plugins.steam_manager import steam
+
+    cookie_writes: list[str] = []
+    monkeypatch.setattr(steam, "validate_community_cookie", lambda c: (False, "缺少 sessionid"))
+    monkeypatch.setattr(steam, "save_community_cookie", lambda c, path=None: cookie_writes.append(c) or str(tmp_path))
+    monkeypatch.setattr(steam, "credentials_status", lambda: {"api_key_configured": False, "cookie_configured": False, "can_use_friends": False, "can_reply_friend": False})
+    inst = _plugin()
+    result = _run(inst.steam_credentials(mode="yui", cookie="BAD", parameters={}))
+    assert result["is_error"] is True
+    assert "验证未通过" in result["output"]
+    assert cookie_writes == []
+
+
+def test_open_app_scans_full_library(monkeypatch) -> None:
+    """按 AppID 打开时必须全量扫描，不能只取前 200 个游戏。"""
+    from plugin.plugins.steam_manager import steam
+
+    limits: list[int] = []
+    launched: list[str] = []
+
+    def _find_game(_path, _query, limit=100):
+        limits.append(limit)
+        return [{"app_id": "999", "name": "Big Library Game", "installed": True}]
+
+    async def _launch_game(self, *, game="", **_):
+        launched.append(game)
+        return {"output": "已启动", "is_error": False}
+
+    monkeypatch.setattr(steam, "find_game", _find_game)
+    inst = _plugin()
+    inst._steam_path = "S"
+    inst.launch_game = _launch_game.__get__(inst, type(inst))
+    result = _run(inst.steam_open_app(game="999"))
+    assert result["is_error"] is False
+    assert limits == [0]
+    assert launched == ["999"]

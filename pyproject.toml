@@ -1,8 +1,8 @@
 [project]
 name = "steam_manager"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = []
 
-[tool.neko.pack]
-# 凭证文件即使被误放到插件目录，也绝不能进入 .neko-plugin 包。
+[tool.neko.build]
+# 实际构建（check -r / build / release）读取 [tool.neko.build]；凭证文件绝不能进包。
 exclude_files = ["steam_api_key.txt", "steam_cookie.txt", "*.tmp"]
