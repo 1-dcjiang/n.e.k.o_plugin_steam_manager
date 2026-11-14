@@ -671,11 +671,15 @@ def _retry_after_seconds(headers) -> float:
 
 
 def _http_get_json(
-    url: str, referer: str | None = None, timeout: float = 15.0, retries: int = 2
+    url: str,
+    referer: str | None = None,
+    timeout: float = 15.0,
+    retries: int = 2,
+    sleep_fn=None,
 ) -> dict:
     """GET 并解析 JSON；429/5xx 有限次退避重试，并遵守 Retry-After。
 
-    网络或解析失败抛 OSError/ValueError；HTTP 状态错误抛 SteamHTTPError。
+    sleep_fn 仅用于测试注入，避免 monkeypatch 全进程 stdlib time.sleep。
     """
     headers = {
         "User-Agent": _UA,
@@ -698,7 +702,7 @@ def _http_get_json(
                     "GET %s -> HTTP %s，%.1fs 后重试（%d/%d）",
                     _safe_url(url), exc.code, delay, attempt + 1, retries,
                 )
-                time.sleep(delay)
+                (sleep_fn or time.sleep)(delay)
                 attempt += 1
                 continue
             _logger.warning("GET %s -> HTTP %s", _safe_url(url), exc.code)

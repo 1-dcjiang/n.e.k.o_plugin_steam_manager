@@ -469,8 +469,7 @@ def test_http_get_json_retries_429_then_succeeds(monkeypatch) -> None:
         return _Resp()
 
     monkeypatch.setattr(steam.urllib.request, "urlopen", _fake_urlopen)
-    monkeypatch.setattr(steam.time, "sleep", lambda _s: None)
-    result = steam._http_get_json("https://api.steampowered.com/x?key=SECRET")
+    result = steam._http_get_json("https://api.steampowered.com/x?key=SECRET", sleep_fn=lambda _s: None)
     assert result == {"ok": True}
     assert len(calls) == 2
 
