@@ -62,7 +62,16 @@ def patch_module_clock():
         time_mod = getattr(module, "time", None)
         if time_mod is None:
             raise AssertionError(f"{module!r} 没有 time 模块，不能替换时钟")
+
+        class _TimeProxy:
+            """只替换被测模块自己的 time 名字，不改 stdlib time 模块。"""
+
+            def __getattr__(self, name):
+                return getattr(time_mod, name)
+
+        proxy = _TimeProxy()
         for name, value in attrs.items():
-            monkeypatch.setattr(time_mod, name, value)
+            setattr(proxy, name, value)
+        monkeypatch.setattr(module, "time", proxy)
 
     return _patch
