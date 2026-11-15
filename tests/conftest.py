@@ -3,6 +3,8 @@ import importlib.util
 import os
 import sys
 
+import pytest
+
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
@@ -46,3 +48,21 @@ if os.path.basename(_PLUGIN_DIR) != _CANONICAL:
             setattr(plugin.plugins, _CANONICAL, _module)
     except Exception as exc:  # 兜底：宿主源码不可用时仍允许纯模块测试导入
         print(f"[conftest] 无法注册本地插件包：{exc}", file=sys.stderr)
+
+
+@pytest.fixture
+def patch_module_clock():
+    """把模块用到的 time 函数临时替换掉（测试总预算/重试窗口用）。
+
+    被测模块统一 `import time` 后调用 `time.monotonic()`；这里按属性名替换，
+    调用方传入的 monkeypatch 负责在用例结束后恢复，避免影响真实时钟。
+    """
+
+    def _patch(monkeypatch, module, **attrs):
+        time_mod = getattr(module, "time", None)
+        if time_mod is None:
+            raise AssertionError(f"{module!r} 没有 time 模块，不能替换时钟")
+        for name, value in attrs.items():
+            monkeypatch.setattr(time_mod, name, value)
+
+    return _patch
