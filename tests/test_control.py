@@ -311,6 +311,48 @@ def test_find_window_by_title_empty_without_user32(monkeypatch) -> None:
     assert control.find_window_by_title("") is None
 
 
+def test_find_window_by_title_skips_browser_with_same_title(monkeypatch) -> None:
+    """标题命中浏览器标签页时不能被当成游戏；枚举全部后按进程过滤再取第一个。"""
+    from plugin.plugins.steam_manager import control
+
+    class _FakeUser32:
+        titles = {11: "Civilization VI - Chrome", 22: "Civilization VI"}
+        pids = {11: 1001, 22: 1002}
+        order = [11, 22]
+
+        def IsWindowVisible(self, hwnd):
+            return True
+
+        def EnumWindows(self, callback, _lparam):
+            for hwnd in self.order:
+                callback(hwnd, 0)
+            return 1
+
+        def GetWindowTextW(self, hwnd, buf, _size):
+            buf.value = self.titles[hwnd]
+            return len(buf.value)
+
+        def GetWindowLongW(self, _hwnd, _index):
+            return 0
+
+        def GetWindowRect(self, hwnd, ptr):
+            rect = ptr._obj
+            rect.left, rect.top, rect.right, rect.bottom = (0, 0, 800, 600)
+            return 1
+
+        def GetWindowThreadProcessId(self, hwnd, ptr):
+            ptr._obj.value = self.pids[hwnd]
+            return 1
+
+    monkeypatch.setattr(control, "USER32", _FakeUser32())
+    monkeypatch.setattr(control, "_process_name",
+                        lambda pid: "chrome.exe" if pid == 1001 else "game.exe")
+    found = control.find_window_by_title("civilization vi")
+    assert found is not None
+    assert found["hwnd"] == 22
+    assert found["process"] == "game.exe"
+
+
 # ══════════ v0.4.2：Win32 结构/签名、多显示器与线程竞态 ══════════
 
 
@@ -423,7 +465,7 @@ def test_frame_watcher_refuses_second_thread_after_stop_timeout(monkeypatch) -> 
 
     watcher._thread = _StuckThread()
     watcher._stop.set()
-    watcher.start()  # 不得创建/启动新线程
+    assert watcher.start() is False  # 不得创建/启动新线程，且必须如实返回 False
     assert watcher._thread is not None
 
 

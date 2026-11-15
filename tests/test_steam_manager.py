@@ -20,7 +20,7 @@ def _plugin():
 
     def _push_message(**kwargs):
         inst._confirm_outbox.append(kwargs)
-        return {"ok": True}
+        return {"ok": True, "submitted": True}
 
     inst.push_message = _push_message
     return inst

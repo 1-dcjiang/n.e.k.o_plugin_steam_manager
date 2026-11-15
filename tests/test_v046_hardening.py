@@ -28,7 +28,7 @@ def _plugin():
 
     def _push_message(**kwargs):
         inst._confirm_outbox.append(kwargs)
-        return {"ok": True}
+        return {"ok": True, "submitted": True}
 
     inst.push_message = _push_message
     inst._civ6_ops_yield = lambda: None
@@ -122,6 +122,87 @@ def test_take_control_binds_target_and_enables(monkeypatch) -> None:
     assert result["is_error"] is False
     assert inst._state.control_enabled is True
     assert inst._state.control_target["hwnd"] == target["hwnd"]
+
+
+def test_confirm_code_push_rejection_is_not_reported_as_sent() -> None:
+    """SDK 的 push_message 失败返回 submitted=False，不抛异常；不能当已推送。"""
+    inst, _ = _plugin()
+    inst.push_message = lambda **kwargs: {
+        "ok": False, "submitted": False, "reason": "backpressure"
+    }
+    assert inst._push_confirm_code("标题", "详情", "123456") is False
+
+
+def test_take_control_keeps_code_when_target_not_foreground(monkeypatch) -> None:
+    """窗口/前台检查失败时，授权码不能先被消费掉，否则用户得重新取码。"""
+    inst, control = _plugin()
+    target = _window()
+    token, code = inst._issue_confirm("control", game=inst._game_window_title)
+    monkeypatch.setattr(control, "find_window_by_title", lambda hint: target)
+    monkeypatch.setattr(control, "get_foreground_window_info",
+                        lambda: _window("Chrome", "chrome.exe", 777))
+
+    first = _run(inst.take_control(on=True, grant_code=code, parameters={}))
+    assert first["error"] == "TARGET_NOT_FOREGROUND"
+    assert token in inst._pending_confirms
+
+    inst._state.note_frame(target, r"C:\tmp\frame.bmp")
+    monkeypatch.setattr(control, "get_foreground_window_info", lambda: target)
+    second = _run(inst.take_control(on=True, grant_code=code, parameters={}))
+    assert second["is_error"] is False
+    assert token not in inst._pending_confirms
+
+
+def test_watch_game_start_failure_is_not_marked_enabled(monkeypatch) -> None:
+    inst, control = _plugin()
+
+    class _FailingWatcher:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def start(self):
+            return False
+
+        def stop(self):
+            pass
+
+    inst._watcher = _FailingWatcher()
+    inst._state.enable_watch()  # 模拟“旧监控已开启”，start 失败后不能继续报开启
+    monkeypatch.setattr(control, "FrameWatcher", _FailingWatcher)
+    result = _run(inst.watch_game(on=True, parameters={}))
+    assert result["error"] == "WATCH_START_FAILED"
+    assert inst._state.watch_enabled is False
+
+
+def test_game_action_click_uses_current_foreground_rect(monkeypatch) -> None:
+    """授权后窗口被拖动/缩放，点击必须按最新 rect 换算，不能用旧 control_target。"""
+    inst, control = _plugin()
+    old = _window()
+    inst._state.note_frame(old, r"C:\tmp\frame.bmp")
+    assert inst._state.enable_control(old) is True
+    fresh = {**old, "rect": (200, 200, 600, 600)}
+    monkeypatch.setattr(control, "get_foreground_window_info", lambda: fresh)
+    seen: list[dict] = []
+
+    def _coords(info, x, y):
+        seen.append(info)
+        return (info["rect"][0] + x, info["rect"][1] + y)
+
+    monkeypatch.setattr(control, "window_client_to_screen", _coords)
+    monkeypatch.setattr(control, "mouse_click_abs", lambda x, y: True)
+    result = _run(inst.game_action(action="click", x=500, y=500, parameters={}))
+    assert result["is_error"] is False
+    assert seen and seen[0]["rect"] == fresh["rect"]
+
+
+def test_game_action_click_requires_explicit_coordinates(monkeypatch) -> None:
+    inst, control = _plugin()
+    target = _window()
+    inst._state.note_frame(target, r"C:\tmp\frame.bmp")
+    assert inst._state.enable_control(target) is True
+    monkeypatch.setattr(control, "get_foreground_window_info", lambda: target)
+    result = _run(inst.game_action(action="click", parameters={}))
+    assert result["error"] == "BAD_COORDS"
 
 
 # ══════════ A5：运营锁期间允许停车 ══════════

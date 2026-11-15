@@ -159,6 +159,7 @@ def _configure_win32() -> None:
     if USER32 is not None:
         # 进程级 DPI awareness：不声明时高分屏下 GetWindowRect/鼠标坐标会被系统虚拟化缩放，
         # 截图尺寸与实际点击位置错位（v0.4.6）。
+        dpi_aware = False
         for name, value in (("SetProcessDpiAwarenessContext", -4), ("SetProcessDPIAware", None)):
             fn = getattr(USER32, name, None)
             if fn is not None:
@@ -167,9 +168,16 @@ def _configure_win32() -> None:
                         fn()
                     else:
                         fn(ctypes.c_void_p(value))
+                    dpi_aware = True
                     break
-                except (OSError, AttributeError, ctypes.ArgumentError):
+                except (OSError, AttributeError, ctypes.ArgumentError) as exc:
+                    _logger.warning("设置 DPI awareness 失败（%s）：%s", name, exc)
                     continue
+        if not dpi_aware:
+            _logger.warning(
+                "没有可用的 DPI awareness API：高分屏下窗口坐标/点击位置可能被系统缩放，"
+                "截图与点击需要按实际 DPI 复核"
+            )
         _set_sig(USER32.GetForegroundWindow, [], wt.HWND)
         _set_sig(USER32.GetWindowTextW, [wt.HWND, wt.LPWSTR, ctypes.c_int], ctypes.c_int)
         # RECT 指针用 c_void_p：模块被重复加载时 POINTER(_Rect) 会绑定到旧类，
@@ -396,9 +404,12 @@ def _write_bmp(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str
 
 
 def find_window_by_title(title_hint: str) -> dict | None:
-    """查找标题包含 title_hint 的可见窗口（不区分大小写），返回窗口信息。
+    """查找标题包含 title_hint 的可见游戏窗口（不区分大小写）。
 
-    默认提示词为 Civilization VI，可通过插件配置 steam.game_window_title 改为其他游戏。
+    标题是外部可控文本：浏览器标签页完全可能带 "Civilization VI"。v0.4.10 起
+    先枚举**所有**标题匹配的窗口，逐个取进程名过滤掉浏览器/终端/资源管理器，
+    再返回第一个通过过滤的窗口；不再“枚举到第一个标题匹配就停”，避免浏览器
+    挡在游戏前面时截图/监控/接管全部找不到游戏。
     """
     if USER32 is None:
         return None
@@ -415,30 +426,34 @@ def find_window_by_title(title_hint: str) -> dict | None:
             title = title_buf.value or ""
             if hint in title.casefold():
                 found.append(hwnd)
-                return False
         return True
 
     USER32.EnumWindows(_enum, 0)
-    if not found:
-        return None
-    hwnd = found[0]
-    rect = _Rect()
-    USER32.GetWindowRect(hwnd, ctypes.byref(rect))
-    style = USER32.GetWindowLongW(hwnd, _GWL_STYLE)
-    if style & _WS_MINIMIZE:
-        return None  # 最小化窗口 PrintWindow 拿不到有效画面
-    title_buf = ctypes.create_unicode_buffer(512)
-    USER32.GetWindowTextW(hwnd, title_buf, 512)
-    pid = wt.DWORD()
-    USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return {
-        "hwnd": hwnd,
-        "title": title_buf.value or "",
-        "pid": pid.value,
-        "process": _process_name(pid.value),
-        "rect": (rect.left, rect.top, rect.right, rect.bottom),
-        "ts": time.time(),
-    }
+    for hwnd in found:
+        style = USER32.GetWindowLongW(hwnd, _GWL_STYLE)
+        if style & _WS_MINIMIZE:
+            continue  # 最小化窗口 PrintWindow 拿不到有效画面
+        rect = _Rect()
+        if not USER32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            continue
+        title_buf = ctypes.create_unicode_buffer(512)
+        USER32.GetWindowTextW(hwnd, title_buf, 512)
+        pid = wt.DWORD()
+        USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        info = {
+            "hwnd": hwnd,
+            "title": title_buf.value or "",
+            "pid": pid.value,
+            "process": _process_name(pid.value),
+            "rect": (rect.left, rect.top, rect.right, rect.bottom),
+            "ts": time.time(),
+        }
+        if is_game_like(info):
+            return info
+        _logger.info(
+            "跳过标题匹配但非游戏进程的窗口：%r / %s", info["title"], info["process"] or "unknown"
+        )
+    return None
 
 
 def find_civ6_window() -> dict | None:
@@ -848,7 +863,12 @@ class FrameWatcher:
         self._stop = threading.Event()
         self._lifecycle = threading.Lock()
 
-    def start(self) -> None:
+    def start(self) -> bool:
+        """启动监控线程；真正启动成功返回 True。
+
+        旧线程 2 秒内没退出、或线程创建/启动失败时返回 False，调用方不得
+        把监控标记为已开启。本方法可能同步等待约 2 秒，异步入口应放进线程池。
+        """
         with self._lifecycle:
             with FrameWatcher._GLOBAL_LOCK:
                 active = FrameWatcher._ACTIVE
@@ -858,7 +878,7 @@ class FrameWatcher:
                         active._thread.join(timeout=2.0)
                     if active._thread and active._thread.is_alive():
                         _logger.warning("另一个帧监控线程尚未退出，拒绝启动新的监控线程")
-                        return
+                        return False
                     FrameWatcher._ACTIVE = None
                 if self._thread and self._thread.is_alive():
                     if self._stop.is_set():
@@ -866,13 +886,19 @@ class FrameWatcher:
                         self._thread.join(timeout=2.0)
                     if self._thread and self._thread.is_alive():
                         _logger.warning("上一帧监控线程尚未退出，拒绝启动第二个线程")
-                        return
+                        return False
                 self._stop.clear()
                 self._thread = threading.Thread(
                     target=self._loop, name="steam-manager-watcher", daemon=True
                 )
-                self._thread.start()
+                try:
+                    self._thread.start()
+                except RuntimeError as exc:
+                    _logger.warning("帧监控线程启动失败：%s", exc)
+                    self._thread = None
+                    return False
                 FrameWatcher._ACTIVE = self
+                return True
 
     def stop(self) -> None:
         with self._lifecycle:

@@ -728,6 +728,32 @@ def _retry_after_seconds(headers) -> float:
     return 0.0
 
 
+def _set_response_read_timeout(resp: object, seconds: float) -> bool:
+    """尽量把底层 socket 的读超时压到剩余总预算。
+
+    CPython 的 ``HTTPResponse.fp.raw._sock`` 是私有实现细节，不同版本/替代实现
+    可能没有。这里按已知形态逐级取，拿不到就返回 False；调用方仍会在每次
+    ``read`` 后检查 deadline，超预算时抛 408，而不是靠私有属性保证正确性。
+    """
+    fp = getattr(resp, "fp", None)
+    raw_fp = getattr(fp, "raw", None)
+    sock = (
+        getattr(raw_fp, "_sock", None)
+        or getattr(raw_fp, "raw_sock", None)
+        or getattr(fp, "_sock", None)
+    )
+    if sock is None:
+        return False
+    set_timeout = getattr(sock, "settimeout", None)
+    if set_timeout is None:
+        return False
+    try:
+        set_timeout(max(0.0, float(seconds)))
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _http_get_json(
     url: str,
     referer: str | None = None,
@@ -763,11 +789,7 @@ def _http_get_json(
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise SteamHTTPError(408, f"请求超出 {total_budget:g}s 总预算")
-                    fp = getattr(resp, "fp", None)
-                    raw_fp = getattr(fp, "raw", None)
-                    sock = getattr(raw_fp, "_sock", None) or getattr(fp, "_sock", None)
-                    if sock is not None:
-                        sock.settimeout(min(timeout, remaining))
+                    _set_response_read_timeout(resp, min(timeout, remaining))
                     chunk = resp.read(64 * 1024)
                     if time.monotonic() >= deadline:
                         raise SteamHTTPError(408, f"请求超出 {total_budget:g}s 总预算")

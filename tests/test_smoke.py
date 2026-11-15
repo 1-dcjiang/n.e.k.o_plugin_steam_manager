@@ -20,7 +20,11 @@ def test_pack_rules_exclude_credentials() -> None:
     rules = data["tool"]["neko"]["build"]["exclude_files"]
     assert "steam_api_key.txt" in rules
     assert "steam_cookie.txt" in rules
-    assert data["project"]["version"] == "0.4.8"
+    plugin_version = tomllib.loads(
+        (root / "plugin.toml").read_text(encoding="utf-8")
+    )["plugin"]["version"]
+    # 两个清单必须同步，否则构建/市场展示会用不同版本号（v0.4.9 曾漂到 0.4.8）。
+    assert data["project"]["version"] == plugin_version
 
 
 def test_build_actually_excludes_credentials(tmp_path) -> None:
