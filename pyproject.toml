@@ -1,7 +1,8 @@
 [project]
 name = "steam_manager"
-version = "0.4.12"
-dependencies = ["Pillow>=10"]
+version = "0.4.13"
+# Pillow 由 N.E.K.O 宿主提供；不要让 Ubuntu CI 为 Windows 插件同步 Linux 二进制。
+dependencies = []
 
 [tool.neko.build]
 # 实际构建（check -r / build / release）读取 [tool.neko.build]；凭证文件绝不能进包。

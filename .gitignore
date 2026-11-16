@@ -5,6 +5,9 @@ __pycache__/
 store.db
 .ruff_cache/
 
+# 官方 sync 生成的平台相关依赖不提交；CI 与本地构建按需生成。
+vendor/
+
 # 凭证绝不能进仓库
 steam_api_key.txt
 steam_cookie.txt

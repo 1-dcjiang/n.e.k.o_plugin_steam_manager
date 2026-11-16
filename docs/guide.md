@@ -93,7 +93,7 @@ require_friend_confirm = false
 
 ## 实现说明
 
-- Win32 窗口、截图与输入调用使用 Python 标准库 `ctypes`；唯一第三方运行时依赖是 **Pillow（导入名 `PIL`）**，用于 GDI 像素 PNG 编码、BMP→PNG 转换与超大截图 JPEG 缩放；不可用时 GDI 截图回退为标准库 BMP，BMP 转 PNG 失败会保留 BMP
+- Win32 窗口、截图与输入调用使用 Python 标准库 `ctypes`；**Pillow（导入名 `PIL`）由 N.E.K.O 宿主提供**，用于 GDI 像素 PNG 编码、BMP→PNG 转换与超大截图 JPEG 缩放；插件不捆绑平台相关的私有 vendor，不可用时 GDI 截图回退为标准库 BMP，BMP 转 PNG 失败会保留 BMP
 - 超大截图在无法使用 Pillow 缩图时不能生成视觉 `images` 条目，会记录警告；其他本地游戏库、价格等功能不受影响
 - 截图文件保存于 `%TEMP%\steam_manager\frames\`，随监控滚动清理；TEMP/TMP 缺失或会退化为当前工作目录时，回退到用户主目录下的 `.steam_manager\tmp`
 - 多显示器：鼠标绝对坐标使用 `SM_*VIRTUALSCREEN` 虚拟桌面边界，不再被钳到主屏

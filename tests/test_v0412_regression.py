@@ -309,13 +309,18 @@ def test_dpi_awareness_not_on_import_and_lazy_once(monkeypatch) -> None:
 
     dll = _DLL()
     fake_windll = types.SimpleNamespace(user32=dll, gdi32=dll, kernel32=dll, psapi=dll)
-    monkeypatch.setattr(control.ctypes, "windll", fake_windll)
+    # ctypes.windll 只在 Windows 存在；Linux CI 也要能注入同一份 Win32 假实现。
+    monkeypatch.setattr(control.ctypes, "windll", fake_windll, raising=False)
     spec = importlib.util.spec_from_file_location(
         "_steam_manager_control_dpi_test", control.__file__,
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert calls == []
+    # 非 Windows 导入时 USER32/GDI32 按设计为 None；导入后再注入，才能跨平台
+    # 验证“首次真实截图前才设置 DPI”而不修改进程全局 os.name。
+    monkeypatch.setattr(module, "USER32", dll)
+    monkeypatch.setattr(module, "GDI32", dll)
     assert module.capture_window_bmp({"rect": (0, 0, 10, 10)}) is None
     assert calls == ["SetProcessDpiAwarenessContext"]
     assert module.capture_window_bmp({"rect": (0, 0, 10, 10)}) is None

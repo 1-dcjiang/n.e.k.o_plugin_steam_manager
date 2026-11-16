@@ -27,6 +27,19 @@ def test_pack_rules_exclude_credentials() -> None:
     assert data["project"]["version"] == plugin_version
 
 
+def test_windows_plugin_uses_host_pillow_without_ci_vendor() -> None:
+    """Ubuntu CI 不得把 Windows 插件的 Pillow 替换成 Linux 二进制。"""
+    root = Path(__file__).resolve().parents[1]
+    data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = data["project"].get("dependencies", [])
+    assert not [item for item in dependencies if item.lower().startswith("pillow")]
+    ignored = {
+        line.strip()
+        for line in (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+    }
+    assert "vendor/" in ignored
+
+
 def test_build_actually_excludes_credentials(tmp_path) -> None:
     """用真实 build 链路打包，凭证文件应被排除；只检查配置文本不算证据。"""
     from plugin.neko_plugin_cli.core import build_plugin
