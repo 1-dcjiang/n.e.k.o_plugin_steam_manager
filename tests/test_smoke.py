@@ -35,7 +35,9 @@ def test_build_actually_excludes_credentials(tmp_path) -> None:
     shutil.copytree(
         Path(__file__).resolve().parents[1],
         src,
-        ignore=shutil.ignore_patterns(".git", "__pycache__", ".ruff_cache", ".pytest_cache", "dist", "build"),
+        ignore=shutil.ignore_patterns(
+            ".git", ".venv", "__pycache__", ".ruff_cache", ".pytest_cache", "dist", "build",
+        ),
     )
     (src / "steam_api_key.txt").write_text("DUMMY_SECRET_TEST", encoding="utf-8")
     (src / "steam_cookie.txt").write_text("DUMMY_COOKIE_TEST", encoding="utf-8")

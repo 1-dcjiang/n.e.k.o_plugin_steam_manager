@@ -1,7 +1,7 @@
 """steam_manager 游戏助手核心：画面读取、行为跟踪、键鼠接管（Windows）。
 
 设计原则：
-- 全部使用 Python 标准库 + ctypes（不依赖第三方包），截图走 GDI（BMP），
+- Win32 调用使用标准库 ctypes，截图走 GDI；Pillow 用于 PNG 编码，缺失时回退 BMP，
   输入走 SendInput / mouse_event / keybd_event
 - 状态机（ControlState）与硬件操作分离，便于单元测试
 - 接管（键鼠模拟）默认关闭，必须由用户显式授权；game_action 仅在
@@ -155,34 +155,15 @@ def _set_sig(fn, argtypes, restype):
 
 
 def _configure_win32() -> None:
-    """显式声明 Win32 签名。64 位下默认 c_int 返回值会把 HWND/HDC 句柄截断成 32 位。"""
+    """只声明 Win32 签名；import 不改变宿主进程的 DPI Awareness。"""
     if USER32 is not None:
-        # 进程级 DPI awareness：不声明时高分屏下 GetWindowRect/鼠标坐标会被系统虚拟化缩放，
-        # 截图尺寸与实际点击位置错位（v0.4.6）。
-        dpi_aware = False
-        for name, value in (("SetProcessDpiAwarenessContext", -4), ("SetProcessDPIAware", None)):
-            fn = getattr(USER32, name, None)
-            if fn is not None:
-                try:
-                    if value is None:
-                        fn()
-                    else:
-                        fn(ctypes.c_void_p(value))
-                    dpi_aware = True
-                    break
-                except (OSError, AttributeError, ctypes.ArgumentError) as exc:
-                    _logger.warning("设置 DPI awareness 失败（%s）：%s", name, exc)
-                    continue
-        if not dpi_aware:
-            _logger.warning(
-                "没有可用的 DPI awareness API：高分屏下窗口坐标/点击位置可能被系统缩放，"
-                "截图与点击需要按实际 DPI 复核"
-            )
         _set_sig(USER32.GetForegroundWindow, [], wt.HWND)
         _set_sig(USER32.GetWindowTextW, [wt.HWND, wt.LPWSTR, ctypes.c_int], ctypes.c_int)
         # RECT 指针用 c_void_p：模块被重复加载时 POINTER(_Rect) 会绑定到旧类，
         # 传 byref(新 _Rect()) 反而报 LP__Rect 类型不匹配。
         _set_sig(USER32.GetWindowRect, [wt.HWND, ctypes.c_void_p], wt.BOOL)
+        _set_sig(USER32.GetClientRect, [wt.HWND, ctypes.c_void_p], wt.BOOL)
+        _set_sig(USER32.ClientToScreen, [wt.HWND, ctypes.c_void_p], wt.BOOL)
         _set_sig(USER32.GetWindowLongW, [wt.HWND, ctypes.c_int], ctypes.c_long)
         _set_sig(USER32.GetWindowThreadProcessId, [wt.HWND, ctypes.POINTER(wt.DWORD)], wt.DWORD)
         _set_sig(USER32.EnumWindows, [_WNDENUMPROC, wt.LPARAM], wt.BOOL)
@@ -248,6 +229,43 @@ def _configure_win32() -> None:
 _configure_win32()
 
 
+_DPI_LOCK = threading.Lock()
+_DPI_AWARENESS_ATTEMPTED = False
+
+
+def _ensure_dpi_awareness() -> None:
+    """首次真实截图/输入前延迟设置一次，不在插件 import 时改宿主全局状态。"""
+    global _DPI_AWARENESS_ATTEMPTED
+    if USER32 is None or _DPI_AWARENESS_ATTEMPTED:
+        return
+    with _DPI_LOCK:
+        if _DPI_AWARENESS_ATTEMPTED:
+            return
+        _DPI_AWARENESS_ATTEMPTED = True
+        dpi_aware = False
+        for name, value in (
+            ("SetProcessDpiAwarenessContext", -4),
+            ("SetProcessDPIAware", None),
+        ):
+            fn = getattr(USER32, name, None)
+            if fn is None:
+                continue
+            try:
+                if value is None:
+                    fn()
+                else:
+                    fn(ctypes.c_void_p(value))
+                dpi_aware = True
+                break
+            except (OSError, AttributeError, ctypes.ArgumentError) as exc:
+                _logger.warning("设置 DPI awareness 失败（%s）：%s", name, exc)
+        if not dpi_aware:
+            _logger.warning(
+                "没有可用的 DPI awareness API：高分屏下窗口坐标/点击位置可能被系统缩放，"
+                "截图与点击需要按实际 DPI 复核"
+            )
+
+
 # ══════════ 窗口与进程信息 ══════════
 
 
@@ -311,6 +329,7 @@ def capture_window_bmp(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
     """截取窗口所在屏幕区域，保存为 BMP，返回文件路径；失败或非 Windows 返回 None。"""
     if USER32 is None or GDI32 is None:
         return None
+    _ensure_dpi_awareness()
     left, top, right, bottom = info["rect"]
     width = max(1, right - left)
     height = max(1, bottom - top)
@@ -403,8 +422,8 @@ def _write_bmp(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str
     return path
 
 
-def find_window_by_title(title_hint: str) -> dict | None:
-    """查找标题包含 title_hint 的可见游戏窗口（不区分大小写）。
+def find_window_by_title(title_hint: str, process_name: str = "") -> dict | None:
+    """查找标题命中的可见游戏窗口；可选进程名按 Windows 规则精确、忽略大小写匹配。
 
     标题是外部可控文本：浏览器标签页完全可能带 "Civilization VI"。v0.4.10 起
     先枚举**所有**标题匹配的窗口，逐个取进程名过滤掉浏览器/终端/资源管理器，
@@ -448,7 +467,7 @@ def find_window_by_title(title_hint: str) -> dict | None:
             "rect": (rect.left, rect.top, rect.right, rect.bottom),
             "ts": time.time(),
         }
-        if is_game_like(info):
+        if is_game_like(info, process_name=process_name):
             return info
         _logger.info(
             "跳过标题匹配但非游戏进程的窗口：%r / %s", info["title"], info["process"] or "unknown"
@@ -469,6 +488,7 @@ def capture_window_printwindow(info: dict, save_dir: str = _FRAME_DIR) -> str | 
     游戏被聊天/终端窗口完全遮挡时也能拿到游戏画面。"""
     if USER32 is None or GDI32 is None:
         return None
+    _ensure_dpi_awareness()
     hwnd = info.get("hwnd")
     if not hwnd:
         return None
@@ -547,6 +567,7 @@ def mouse_click_abs(screen_x: int, screen_y: int) -> bool:
     """在屏幕绝对坐标点击左键；返回是否确认注入 3 个事件（UIPI 拦截时为 False）。"""
     if USER32 is None:
         return False
+    _ensure_dpi_awareness()
     vx, vy, vw, vh = _screen_bounds()
     sx = max(vx, min(vx + vw - 1, int(screen_x)))
     sy = max(vy, min(vy + vh - 1, int(screen_y)))
@@ -597,6 +618,7 @@ def press_key(vk: int) -> bool:
     """按下并抬起一个虚拟键；返回是否确认注入 2 个事件。"""
     if USER32 is None or not isinstance(vk, int) or not (1 <= vk <= 255):
         return False
+    _ensure_dpi_awareness()
     extra = ctypes.c_size_t(0)
     send_input = getattr(USER32, "SendInput", None)
     if send_input is not None:
@@ -648,6 +670,7 @@ def type_text(text: str) -> int:
     """
     if USER32 is None or not text:
         return 0
+    _ensure_dpi_awareness()
     units = _unicode_units(text)
     if not units:
         return 0
@@ -669,19 +692,30 @@ def type_text(text: str) -> int:
 
 
 def window_client_to_screen(info: dict, rel_x: float, rel_y: float) -> tuple[int, int]:
-    """把窗口内相对坐标（0-1000 千分比）换算为屏幕绝对坐标（含右下边界 clamp）。"""
-    left, top, right, bottom = info["rect"]
-    w = max(1, right - left)
-    h = max(1, bottom - top)
+    """把客户区相对千分比坐标换算为屏幕坐标，不把边框/标题栏计入尺寸。"""
+    if USER32 is None or not info.get("hwnd"):
+        raise ValueError("当前环境无法读取窗口客户区")
+    _ensure_dpi_awareness()
+    client_rect = _Rect()
+    client_origin = wt.POINT(0, 0)
+    try:
+        got_rect = USER32.GetClientRect(info["hwnd"], ctypes.byref(client_rect))
+        got_origin = USER32.ClientToScreen(info["hwnd"], ctypes.byref(client_origin))
+    except (OSError, AttributeError, ValueError, TypeError, ctypes.ArgumentError) as exc:
+        raise ValueError("读取窗口客户区失败") from exc
+    if not got_rect or not got_origin:
+        raise ValueError("读取窗口客户区失败")
+    width = max(1, client_rect.right - client_rect.left)
+    height = max(1, client_rect.bottom - client_rect.top)
     rel_x = max(0.0, min(1000.0, float(rel_x)))
     rel_y = max(0.0, min(1000.0, float(rel_y)))
-    sx = left + min(w - 1, int(w * rel_x / 1000))
-    sy = top + min(h - 1, int(h * rel_y / 1000))
-    if USER32 is not None:
-        vx, vy, vw, vh = _screen_bounds()
-        sx = max(vx, min(vx + vw - 1, sx))
-        sy = max(vy, min(vy + vh - 1, sy))
-    return sx, sy
+    sx = client_origin.x + min(width - 1, int(width * rel_x / 1000))
+    sy = client_origin.y + min(height - 1, int(height * rel_y / 1000))
+    vx, vy, vw, vh = _screen_bounds()
+    return (
+        max(vx, min(vx + vw - 1, sx)),
+        max(vy, min(vy + vh - 1, sy)),
+    )
 
 
 # ══════════ 状态机（纯逻辑，可测） ══════════
@@ -837,11 +871,15 @@ _NON_GAME_PROCESSES = {
 }
 
 
-def is_game_like(info: dict | None) -> bool:
-    """标题可伪造，进程名是硬边界；浏览器/终端/资源管理器不算游戏窗口。"""
+def is_game_like(info: dict | None, process_name: str = "") -> bool:
+    """复用唯一进程黑名单，并可选要求精确进程名（忽略 Windows 大小写）。"""
     if not info:
         return False
-    return str(info.get("process") or "").strip().casefold() not in _NON_GAME_PROCESSES
+    actual = os.path.basename(str(info.get("process") or "").strip()).casefold()
+    if actual in _NON_GAME_PROCESSES:
+        return False
+    expected = os.path.basename(str(process_name or "").strip()).casefold()
+    return not expected or actual == expected
 
 
 class FrameWatcher:
@@ -855,10 +893,14 @@ class FrameWatcher:
     _GLOBAL_LOCK = threading.Lock()
     _ACTIVE: "FrameWatcher | None" = None
 
-    def __init__(self, state: ControlState, interval: float = 3.0, title_hint: str = "") -> None:
+    def __init__(
+        self, state: ControlState, interval: float = 3.0,
+        title_hint: str = "", process_name: str = "",
+    ) -> None:
         self._state = state
         self._interval = max(_MIN_INTERVAL, float(interval))
         self._title_hint = (title_hint or "").strip()
+        self._process_name = (process_name or "").strip()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lifecycle = threading.Lock()
@@ -915,6 +957,8 @@ class FrameWatcher:
 
     def _target(self) -> dict | None:
         if self._title_hint:
+            if self._process_name:
+                return find_window_by_title(self._title_hint, self._process_name)
             return find_window_by_title(self._title_hint)
         return get_foreground_window_info()
 
@@ -922,7 +966,7 @@ class FrameWatcher:
         while not self._stop.is_set():
             try:
                 target = self._target()
-                if target and not is_game_like(target):
+                if target and not is_game_like(target, process_name=self._process_name):
                     # 标题命中的是浏览器/终端：不记帧、不截图，避免把网页当游戏画面。
                     target = None
                 if target:

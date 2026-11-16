@@ -39,6 +39,37 @@ _logger = logging.getLogger("N.E.K.O.Plugin_steam_manager.steam")
 _CREDENTIAL_MARKER = "NEKO_DPAPI_V1\n"
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+_MAX_CHAT_RESPONSE_BYTES = 64 * 1024
+_VALVE_COOKIE_DOMAINS = ("steamcommunity.com", "steampowered.com")
+
+
+def _is_allowed_cookie_url(url: str) -> bool:
+    """Cookie 只允许跟随到 Valve 相关 HTTPS 主机及其子域。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").rstrip(".").casefold()
+    except ValueError:
+        return False
+    if parts.scheme.casefold() != "https" or not host:
+        return False
+    return any(host == domain or host.endswith("." + domain) for domain in _VALVE_COOKIE_DOMAINS)
+
+
+class _ValveCookieRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Valve 域名间正常跳转保留 Cookie，跨域或降级 HTTP 时移除敏感头。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None and not _is_allowed_cookie_url(new_req.full_url):
+            new_req.remove_header("Cookie")
+            new_req.remove_header("Origin")
+        return new_req
+
+
+def _open_cookie_request(req: urllib.request.Request, timeout: float):
+    """用受限重定向策略打开携带 Steam Cookie 的请求。"""
+    return urllib.request.build_opener(_ValveCookieRedirectHandler).open(req, timeout=timeout)
+
 
 _PERSONA_STATE = {0: "离线", 1: "在线", 2: "离开", 3: "忙碌", 4: "打盹", 5: "想交易", 6: "想玩"}
 
@@ -591,7 +622,7 @@ def _probe_cookie_page(cookie: str) -> tuple[str, str]:
         "https://steamcommunity.com/my/profile",
         headers={"User-Agent": _UA, "Cookie": cookie},
     )
-    with urllib.request.urlopen(req, timeout=8.0) as resp:
+    with _open_cookie_request(req, timeout=8.0) as resp:
         return resp.geturl(), resp.read(65536).decode("utf-8", errors="replace")
 
 
@@ -697,6 +728,10 @@ class SteamHTTPError(OSError):
     def __init__(self, status: int, reason: str = "") -> None:
         super().__init__(f"HTTP {status}" + (f": {reason}" if reason else ""))
         self.status = int(status)
+
+
+class SteamResponseTooLarge(ValueError):
+    """聊天响应超过硬上限；与 Cookie 失效和网络异常分开诊断。"""
 
 
 def redact_text(value: object, limit: int = 300) -> str:
@@ -990,8 +1025,11 @@ def send_friend_message(cookie: str, my_steam_id: str, friend_steam_id: str, tex
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15.0) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+        with _open_cookie_request(req, timeout=15.0) as resp:
+            response_bytes = resp.read(_MAX_CHAT_RESPONSE_BYTES + 1)
+            if len(response_bytes) > _MAX_CHAT_RESPONSE_BYTES:
+                raise SteamResponseTooLarge("聊天接口响应超过 64KB，已拒绝处理")
+            raw = response_bytes.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         raise SteamHTTPError(exc.code, str(exc.reason or "")) from exc
     except urllib.error.URLError as exc:
@@ -1129,9 +1167,17 @@ def open_app(steam_path: str | None, app_id: str, installed: bool) -> dict:
             return {"ok": False, "error": "STEAM_NOT_FOUND", "output": "未检测到 Steam 安装目录，无法启动。"}
         return launch_game(steam_path, app_id)
     try:
-        webbrowser.open(f"steam://openurl/https://store.steampowered.com/app/{app_id}")
+        opened = webbrowser.open(
+            f"steam://openurl/https://store.steampowered.com/app/{app_id}"
+        )
     except OSError as exc:
         return {"ok": False, "error": "OPEN_FAILED", "output": f"打开商店页失败：{exc}"}
+    if not opened:
+        return {
+            "ok": False,
+            "error": "OPEN_FAILED",
+            "output": "浏览器/Steam 客户端未接受打开请求，未能打开商店页。",
+        }
     return {
         "ok": True,
         "output": f"游戏（AppID {app_id}）未安装，已打开 Steam 商店页；在页面点击「安装」即可下载后游玩。",

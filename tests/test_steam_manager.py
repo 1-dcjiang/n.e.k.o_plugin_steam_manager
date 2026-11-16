@@ -173,7 +173,7 @@ def test_credentials_auto_without_credential_opens_guide(monkeypatch) -> None:
     from plugin.plugins.steam_manager import steam
 
     opened: list[str] = []
-    monkeypatch.setattr(pkg, "webbrowser", type("W", (), {"open": staticmethod(lambda u: opened.append(u))})())
+    monkeypatch.setattr(pkg, "webbrowser", type("W", (), {"open": staticmethod(lambda u: opened.append(u) or True)})())
     monkeypatch.setattr(steam, "credentials_status", lambda: {"api_key_configured": False, "cookie_configured": False, "can_use_friends": False, "can_reply_friend": False})
     inst = _plugin()
     result = _run(inst.steam_credentials(mode="auto", parameters={}))

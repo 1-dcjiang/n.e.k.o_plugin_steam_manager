@@ -242,7 +242,7 @@ def test_open_app_not_installed_opens_store(monkeypatch) -> None:
     from plugin.plugins.steam_manager import steam
 
     opened: list[str] = []
-    monkeypatch.setattr(steam, "webbrowser", type("W", (), {"open": staticmethod(lambda u: opened.append(u))})())
+    monkeypatch.setattr(steam, "webbrowser", type("W", (), {"open": staticmethod(lambda u: opened.append(u) or True)})())
     result = steam.open_app(None, "730", False)
     assert result["ok"] is True
     assert "商店页" in result["output"]

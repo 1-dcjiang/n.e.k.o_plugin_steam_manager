@@ -1,4 +1,4 @@
-"""steam_manager — Steam 管理 + 游戏助手（v0.4.6）。
+"""steam_manager — Steam 管理 + 游戏助手（v0.4.12）。
 
 安全边界：只读本地库元数据；启动游戏需用户明确指令；截图与行为跟踪
 仅在用户开启监控后运行；键鼠接管（YUI 操作游戏）默认关闭，必须由
@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import secrets
 import time
 import webbrowser
 
@@ -25,6 +24,7 @@ from plugin.sdk.plugin import (
 )
 
 from . import control, steam
+from .confirmation import ConfirmationManager
 
 _logger = logging.getLogger("N.E.K.O.Plugin_steam_manager")
 
@@ -122,20 +122,24 @@ class SteamManagerPlugin(NekoPluginBase):
         self._state = control.ControlState()
         self._watcher = control.FrameWatcher(self._state)
         self._game_window_title = "civilization vi"
+        self._game_process = ""
+        self._require_friend_confirm = False
         self._pending_confirms: dict[str, dict] = {}
+        self._confirmations = ConfirmationManager(self._pending_confirms)
 
-    def _issue_confirm(self, kind: str, **payload) -> tuple[str, str]:
-        """发出一次性确认令牌与 6 位确认码；确认码只推给用户界面，不回给模型。"""
-        now = time.monotonic()
+    def _confirmation_manager(self) -> ConfirmationManager:
+        """兼容宿主测试/旧实例的延迟初始化，并始终复用公开状态字典。"""
         pending = getattr(self, "_pending_confirms", None)
         if pending is None:
             pending = self._pending_confirms = {}
-        for token in [t for t, item in pending.items() if item.get("expires", 0) < now]:
-            pending.pop(token, None)
-        token = secrets.token_urlsafe(12)
-        code = f"{secrets.randbelow(1_000_000):06d}"
-        pending[token] = {"kind": kind, "expires": now + 300, "code": code, **payload}
-        return token, code
+        manager = getattr(self, "_confirmations", None)
+        if manager is None or manager.pending is not pending:
+            manager = self._confirmations = ConfirmationManager(pending)
+        return manager
+
+    def _issue_confirm(self, kind: str, **payload) -> tuple[str, str]:
+        """发出一次性确认令牌与 6 位确认码；确认码只推给用户界面，不回给模型。"""
+        return self._confirmation_manager().issue(kind, **payload)
 
     def _push_confirm_code(self, title: str, detail: str, code: str) -> bool:
         """把确认码推到用户可见的对话；ai_behavior=blind 保证模型读不到码。"""
@@ -162,44 +166,10 @@ class SteamManagerPlugin(NekoPluginBase):
     def _consume_confirm(
         self, token_or_code: str, kind: str, *, consume: bool = True, **expected
     ) -> dict | None:
-        """校验一次性确认；``consume=False`` 只校验不消费。
-
-        接受确认码（用户界面读取）或内部令牌；过期/类型/参数不符都无效。
-        ``take_control`` 先用 ``consume=False`` 校验，等窗口/前台/画面证据全部
-        通过后再真正消费，避免游戏不在前台时把用户刚拿到的码白白烧掉。
-        """
-        value = str(token_or_code or "").strip()
-        if not value:
-            return None
-        pending = getattr(self, "_pending_confirms", {})
-        found = None
-        if value in pending:
-            if pending[value].get("kind") == kind:
-                found = value
-        else:
-            for token, item in pending.items():
-                if item.get("code") == value and item.get("kind") == kind:
-                    found = token
-                    break
-        if found is None:
-            # 防猜测：同一类确认连续错 3 次就作废，不能让模型穷举 6 位码。
-            for token, item in list(pending.items()):
-                if item.get("kind") != kind:
-                    continue
-                item["attempts"] = int(item.get("attempts") or 0) + 1
-                if item["attempts"] >= 3:
-                    pending.pop(token, None)
-            return None
-        item = pending.get(found)
-        if consume:
-            # 真正消费时即使用户拿旧码配错了对象也作废，避免用同一个码反复试探。
-            pending.pop(found, None)
-        if not item or item.get("expires", 0) < time.monotonic():
-            return None
-        for key, value_expected in expected.items():
-            if item.get(key) != value_expected:
-                return None
-        return item
+        """校验一次性确认；``consume=False`` 只校验不消费。"""
+        return self._confirmation_manager().consume(
+            token_or_code, kind, consume=consume, **expected
+        )
 
     def _friend_confirm_required(self, friend: str, text: str, target: dict, reason: str, warnings: list[str]) -> dict:
         _, code = self._issue_confirm(
@@ -280,11 +250,24 @@ class SteamManagerPlugin(NekoPluginBase):
             _logger.warning("读取配置失败，使用默认窗口标题：%s", exc)
             cfg = {}
         steam_cfg = cfg.get("steam") if isinstance(cfg, dict) and isinstance(cfg.get("steam"), dict) else {}
-        hint = str(steam_cfg.get("game_window_title") or "").strip()
-        if hint:
-            self._game_window_title = hint
+        # 配置键存在时，空串也是明确选择：禁用 PrintWindow 直抓，不回退默认文明6。
+        if "game_window_title" in steam_cfg:
+            self._game_window_title = str(steam_cfg.get("game_window_title") or "").strip()
+        self._game_process = str(steam_cfg.get("game_process") or "").strip()
+        self._require_friend_confirm = _as_bool(
+            steam_cfg.get("require_friend_confirm"), default=False
+        )
         self._steam_path = await asyncio.to_thread(steam.find_steam_path)
         return {"status": "ready", "plugin": "steam_manager"}
+
+    async def _find_game_window(self, title_hint: str) -> dict | None:
+        """按标题及可选进程名查找目标；保持旧测试/调用的一参数兼容路径。"""
+        process_name = getattr(self, "_game_process", "")
+        if process_name:
+            return await asyncio.to_thread(
+                control.find_window_by_title, title_hint, process_name
+            )
+        return await asyncio.to_thread(control.find_window_by_title, title_hint)
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_):
@@ -393,15 +376,17 @@ class SteamManagerPlugin(NekoPluginBase):
         matches = await asyncio.to_thread(steam.find_game, path, game)
         installed = [g for g in matches if g["installed"]]
         if not installed:
-            return {"output": f"未找到已安装的游戏「{game}」。可先用 list_games 查看游戏库。", "is_error": True, "error": "NO_MATCH"}
+            return {"output": f"未找到已安装的游戏「{_untrusted(game)}」。可先用 list_games 查看游戏库。", "is_error": True, "error": "NO_MATCH"}
         if len(installed) > 1:
-            candidates = "、".join(f"{g['name']}（{g['app_id']}）" for g in installed[:10])
-            return {"output": f"「{game}」匹配到多个游戏，请指定精确名称或 AppID：{candidates}", "is_error": True, "error": "AMBIGUOUS"}
+            candidates = "、".join(
+                f"{_untrusted(g['name'])}（{g['app_id']}）" for g in installed[:10]
+            )
+            return {"output": f"「{_untrusted(game)}」匹配到多个游戏，请指定精确名称或 AppID：{candidates}", "is_error": True, "error": "AMBIGUOUS"}
         target = installed[0]
         result = await asyncio.to_thread(steam.launch_game, path, target["app_id"])
         if not result.get("ok"):
             return {"output": result.get("output", "启动失败。"), "is_error": True, "error": result.get("error", "LAUNCH_FAILED")}
-        return {"output": f"正在启动「{target['name']}」（AppID {target['app_id']}）。", "is_error": False}
+        return {"output": f"正在启动「{_untrusted(target['name'])}」（AppID {target['app_id']}）。", "is_error": False}
 
     # ══════════ 账号 / 好友 / 价格 / 促销（v0.3.0） ══════════
 
@@ -629,12 +614,19 @@ class SteamManagerPlugin(NekoPluginBase):
                 target = next(iter(exact.values()))
                 friend_sid = target["steam_id"]
                 friend_label = target.get("name") or friend_sid
-                # 好友概要部分失败时，缺失批次里可能还有同名好友；精确昵称也要确认。
-                if warnings and not (_is_ascii_digits(friend) and friend == target["steam_id"]):
+                # 强制开关覆盖所有精确匹配分支；确认码路径已在上方验证，不会重复要求。
+                force_confirm = getattr(self, "_require_friend_confirm", False)
+                partial_nickname = warnings and not (
+                    _is_ascii_digits(friend) and friend == target["steam_id"]
+                )
+                if force_confirm or partial_nickname:
+                    reason = (
+                        "已开启所有发送强制确认；即使精确匹配也必须确认。"
+                        if force_confirm
+                        else f"好友概要部分失败（{len(warnings)} 批），精确同名好友可能仍在缺失批次里；"
+                    )
                     return self._friend_confirm_required(
-                        friend, text, target,
-                        f"好友概要部分失败（{len(warnings)} 批），精确同名好友可能仍在缺失批次里；",
-                        warnings,
+                        friend, text, target, reason, warnings,
                     )
             elif len(exact) > 1:
                 cand = "、".join(
@@ -669,12 +661,36 @@ class SteamManagerPlugin(NekoPluginBase):
                 )
         try:
             result = await asyncio.to_thread(steam.send_friend_message, cookie, sid, friend_sid, text)
+        except steam.SteamResponseTooLarge as exc:
+            return {
+                "output": f"发送失败：{steam.redact_text(exc)}。这不是 Cookie 失效诊断，未重试发送。",
+                "is_error": True,
+                "error": "CHAT_RESPONSE_TOO_LARGE",
+            }
+        except steam.SteamHTTPError as exc:
+            if exc.status in (401, 403):
+                return {
+                    "output": f"发送失败：Cookie 无效或已过期（HTTP {exc.status}），请重新配置 Cookie。",
+                    "is_error": True,
+                    "error": "COOKIE_INVALID",
+                }
+            if exc.status in (404, 405, 410):
+                return {
+                    "output": (
+                        f"发送失败：Steam 旧网页聊天接口不可用或已下线（HTTP {exc.status}），"
+                        "这不是 Cookie 失效诊断。请等待插件适配仍受支持的聊天接口。"
+                    ),
+                    "is_error": True,
+                    "error": "CHAT_API_UNAVAILABLE",
+                }
+            return {
+                "output": f"发送失败：聊天接口返回 HTTP {exc.status}，请稍后重试。",
+                "is_error": True,
+                "error": "SEND_FAILED",
+            }
         except (OSError, ValueError) as exc:
             return {
-                "output": (
-                    f"发送给「{_untrusted(friend_label)}」（{friend_sid}）失败：{steam.redact_text(exc)}。"
-                    "请确认 Cookie 未过期、目标 SteamID 正确；必要时重新配置 Cookie 或稍后重试。"
-                ),
+                "output": f"发送给「{_untrusted(friend_label)}」（{friend_sid}）失败：{steam.redact_text(exc)}。请检查网络与目标 SteamID 后重试。",
                 "is_error": True,
                 "error": "SEND_FAILED",
             }
@@ -973,13 +989,26 @@ class SteamManagerPlugin(NekoPluginBase):
                 }
             # auto：绝不自动读取/解密浏览器 Cookie；只打开官方获取页并说明手动粘贴
             try:
-                await asyncio.to_thread(webbrowser.open, "https://steamcommunity.com/dev/apikey")
-                opened = "已为你打开 Steam API Key 获取页（https://steamcommunity.com/dev/apikey）。\n"
-            except OSError:
-                opened = "请打开 https://steamcommunity.com/dev/apikey 获取 API Key。\n"
+                opened_ok = await asyncio.to_thread(
+                    webbrowser.open, "https://steamcommunity.com/dev/apikey"
+                )
+            except OSError as exc:
+                return {
+                    "output": f"无法打开 Steam API Key 获取页：{exc}。请手动打开 https://steamcommunity.com/dev/apikey。",
+                    "is_error": True,
+                    "error": "OPEN_FAILED",
+                    "result": {"mode": "auto", "source": "manual", **status},
+                }
+            if not opened_ok:
+                return {
+                    "output": "浏览器未接受打开请求，未打开 Steam API Key 获取页。请手动打开 https://steamcommunity.com/dev/apikey。",
+                    "is_error": True,
+                    "error": "OPEN_FAILED",
+                    "result": {"mode": "auto", "source": "manual", **status},
+                }
             return {
                 "output": (
-                    opened
+                    "已为你打开 Steam API Key 获取页（https://steamcommunity.com/dev/apikey）。\n"
                     + "步骤：1) 在页面登录你的 Steam 账号，域名填 localhost 即可点创建；"
                     "2) 把生成的 Key 复制给我（说'配置 Steam，Key 是……'），我会加密写入并验证；"
                     "3) 回复好友还需 steamcommunity 登录 Cookie：请在浏览器登录 steamcommunity.com，"
@@ -1031,11 +1060,12 @@ class SteamManagerPlugin(NekoPluginBase):
         if _y:
             return _y
         hint = (self._game_window_title or "").strip()
+        process_name = getattr(self, "_game_process", "")
         info = await asyncio.to_thread(control.get_foreground_window_info)
         civ = None
         if hint:
-            civ = await asyncio.to_thread(control.find_window_by_title, hint)
-            if civ and not _target_allowed(civ):
+            civ = await self._find_game_window(hint)
+            if civ and not _target_allowed(civ, process_name):
                 civ = None
         _logger.info("game_capture: fg=%r target_window=%r",
                      info and info.get("title"), civ and civ.get("title"))
@@ -1088,6 +1118,12 @@ class SteamManagerPlugin(NekoPluginBase):
             }
         if not info:
             return {"output": "没有检测到前台窗口（可能窗口已最小化）。请确认游戏窗口在前台。", "is_error": True, "error": "NO_WINDOW"}
+        if process_name and not _target_allowed(info, process_name):
+            return {
+                "output": f"前台窗口进程不符合 steam.game_process={_untrusted(process_name, 60)}，已拒绝截图。",
+                "is_error": True,
+                "error": "GAME_WINDOW_NOT_FOUND",
+            }
         path = await asyncio.to_thread(control.capture_window_bmp, info)
         if not path:
             return {"output": "截图失败：无法读取屏幕区域。", "is_error": True, "error": "CAPTURE_FAILED"}
@@ -1149,7 +1185,10 @@ class SteamManagerPlugin(NekoPluginBase):
         # 旧 watcher 已停：先把状态落回关闭，start() 失败时 summary 不会继续报“已开启”。
         self._state.disable_watch()
         self._watcher = control.FrameWatcher(
-            self._state, interval=interval, title_hint=self._game_window_title
+            self._state,
+            interval=interval,
+            title_hint=self._game_window_title,
+            process_name=getattr(self, "_game_process", ""),
         )
         # start() 可能等待旧线程退出（最长约 2 秒）并返回是否真的启动；
         # 放线程池里跑，事件循环不被阻塞；没起来就不许回复“已开启”。
@@ -1278,13 +1317,13 @@ class SteamManagerPlugin(NekoPluginBase):
                 "error": "GRANT_CODE_INVALID",
             }
         hint = (self._game_window_title or "").strip()
-        target = await asyncio.to_thread(control.find_window_by_title, hint) if hint else None
+        process_name = getattr(self, "_game_process", "")
+        target = await self._find_game_window(hint) if hint else None
         fg = await asyncio.to_thread(control.get_foreground_window_info)
-        if not target:
-            target = fg
+        # 找不到标题/进程匹配的游戏时必须拒绝，绝不能把当前前台窗口当作兜底目标。
         if not target:
             return {"output": "无法开启接管：没有找到目标游戏窗口。", "is_error": True, "error": "NO_WINDOW"}
-        if not _target_allowed(target):
+        if not _target_allowed(target, process_name):
             return {
                 "output": f"拒绝接管：目标窗口进程「{_untrusted(target.get('process'), 60)}」不是游戏进程（浏览器/终端/资源管理器一律拒绝）。",
                 "is_error": True,
@@ -1326,16 +1365,16 @@ class SteamManagerPlugin(NekoPluginBase):
         description=(
             "在已授权的游戏窗口上执行一次键鼠动作。何时用：YUI 已获得接管授权（take_control on）后，"
             "需要点击画面或按键操作游戏时。"
-            "参数 action：click（点击，需 x/y，窗口内相对坐标 0-1000）、key（按键，key 为单字母或 1-255 的虚拟键码）、"
-            "text（输入文本，text 支持 Unicode（含中文、大写与符号））；x/y：点击坐标（窗口相对千分比）。"
+            "参数 action：click（点击，需 x/y，客户区相对坐标 0-1000，不含窗口边框/标题栏）、key（按键，key 为单字母或白名单虚拟键码）、"
+            "text（输入文本，text 支持 Unicode（含中文、大写与符号））；x/y：点击坐标（客户区相对千分比）。"
             "安全：仅当接管开启且窗口仍在场时可用；每次动作都会记录到行为时间线。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["click", "key", "text"], "description": "动作类型"},
-                "x": {"type": "integer", "description": "click 的窗口相对 X（0-1000）"},
-                "y": {"type": "integer", "description": "click 的窗口相对 Y（0-1000）"},
+                "x": {"type": "integer", "description": "click 的客户区相对 X（0-1000）"},
+                "y": {"type": "integer", "description": "click 的客户区相对 Y（0-1000）"},
                 "key": {"type": "string", "description": "key 的单字母或虚拟键码（1-255）"},
                 "text": {"type": "string", "description": "text 的内容（支持 Unicode）"},
             },
@@ -1393,9 +1432,16 @@ class SteamManagerPlugin(NekoPluginBase):
             # 授权后玩家可能拖动/缩放/Alt+Enter 全屏：hwnd 不变，但 control_target
             # 里是授权那一刻的旧 rect。必须用刚取到的前台窗口信息换算屏幕坐标，
             # 否则点击会落在窗口移动前的位置。
-            sx, sy = control.window_client_to_screen(
-                fg, max(0, min(1000, x)), max(0, min(1000, y))
-            )
+            try:
+                sx, sy = control.window_client_to_screen(
+                    fg, max(0, min(1000, x)), max(0, min(1000, y))
+                )
+            except (TypeError, ValueError) as exc:
+                return {
+                    "output": f"点击失败：{exc}；未按完整窗口矩形猜测坐标。",
+                    "is_error": True,
+                    "error": "CLIENT_RECT_UNAVAILABLE",
+                }
             clicked = await asyncio.to_thread(control.mouse_click_abs, sx, sy)
             if not clicked:
                 self._state.note_event("action_failed", f"click SendInput 失败 @ 屏幕 ({sx},{sy})")
@@ -1477,8 +1523,8 @@ class SteamManagerPlugin(NekoPluginBase):
                 "text": {"type": "string", "description": "发给好友的消息内容（action=reply 时用）"},
                 "on": {"type": "boolean", "description": "watch / control 的开关：true 开，false 关"},
                 "interval": {"type": "integer", "description": "watch 的截帧间隔秒数"},
-                "click_x": {"type": "integer", "description": "action=click 的窗口相对 X（0-1000）"},
-                "click_y": {"type": "integer", "description": "action=click 的窗口相对 Y（0-1000）"},
+                "click_x": {"type": "integer", "description": "action=click 的客户区相对 X（0-1000）"},
+                "click_y": {"type": "integer", "description": "action=click 的客户区相对 Y（0-1000）"},
                 "key": {"type": "string", "description": "action=key 的单字母或虚拟键码"},
                 "sub_action": {"type": "string", "description": "action=action 时的子操作：click / key / text（v0.3.1 修复入口可达性）"},
                 "mode": {"type": "string", "description": "action=setup 的凭证配置模式：skip / yui / auto"},
@@ -1504,11 +1550,19 @@ class SteamManagerPlugin(NekoPluginBase):
             interval = int(kwargs.get("interval") or params.get("interval") or 0)
         except (TypeError, ValueError):
             interval = 0
-        try:
-            click_x = int(kwargs.get("click_x") or params.get("click_x") or 0)
-            click_y = int(kwargs.get("click_y") or params.get("click_y") or 0)
-        except (TypeError, ValueError):
-            click_x, click_y = 0, 0
+
+        def _click_coordinate(name: str) -> int | None:
+            # 缺失与非法值都保留为 None，由 game_action 拒绝；合法的 0 不能用 `or` 吞掉。
+            raw = kwargs[name] if name in kwargs else params.get(name)
+            if raw is None:
+                return None
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return None
+
+        click_x = _click_coordinate("click_x")
+        click_y = _click_coordinate("click_y")
         key = str(kwargs.get("key") or params.get("key") or "")
         sub_action = str(kwargs.get("sub_action") or params.get("sub_action") or params.get("act") or "")
         steam_id = str(kwargs.get("steam_id") or params.get("steam_id") or "")
@@ -1517,44 +1571,51 @@ class SteamManagerPlugin(NekoPluginBase):
         text = str(kwargs.get("text") or params.get("text") or "")
         confirm_code = str(kwargs.get("confirm_code") or params.get("confirm_code") or "")
         grant_code = str(kwargs.get("grant_code") or params.get("grant_code") or "")
-        if action in ("status", ""):
-            return await self.steam_status()
-        if action in ("list", "games"):
-            return await self.list_games(keyword=keyword, limit=limit, parameters={})
-        if action in ("launch", "start"):
-            return await self.launch_game(game=game, parameters={})
-        if action in ("account", "me", "profile"):
-            return await self.steam_account(steam_id=steam_id, parameters={})
-        if action in ("friends", "friendlist"):
-            return await self.steam_friends(steam_id=steam_id, name_filter=name_filter, parameters={})
-        if action in ("reply", "message"):
-            return await self.steam_reply_friend(friend=friend, text=text, confirm_code=confirm_code, parameters={})
-        if action in ("price", "pricing"):
-            return await self.steam_game_price(game=game, parameters={})
-        if action in ("setup", "credentials", "config"):
-            return await self.steam_credentials(
+        aliases = {
+            "": "status", "games": "list", "start": "launch",
+            "me": "account", "profile": "account", "friendlist": "friends",
+            "message": "reply", "pricing": "price", "credentials": "setup",
+            "config": "setup", "promotions": "promo", "sale": "promo",
+            "open_app": "open", "screenshot": "capture", "monitor": "watch",
+            "state": "summary", "take_control": "control", "operate": "action",
+        }
+        action = aliases.get(action, action)
+        handlers = {
+            "status": lambda: self.steam_status(),
+            "list": lambda: self.list_games(keyword=keyword, limit=limit, parameters={}),
+            "launch": lambda: self.launch_game(game=game, parameters={}),
+            "account": lambda: self.steam_account(steam_id=steam_id, parameters={}),
+            "friends": lambda: self.steam_friends(
+                steam_id=steam_id, name_filter=name_filter, parameters={}
+            ),
+            "reply": lambda: self.steam_reply_friend(
+                friend=friend, text=text, confirm_code=confirm_code, parameters={}
+            ),
+            "price": lambda: self.steam_game_price(game=game, parameters={}),
+            "setup": lambda: self.steam_credentials(
                 mode=str(kwargs.get("mode") or params.get("mode") or "auto"),
                 api_key=str(kwargs.get("api_key") or params.get("api_key") or ""),
                 cookie=str(kwargs.get("cookie") or params.get("cookie") or ""),
                 parameters={},
-            )
-        if action in ("promo", "promotions", "sale"):
-            return await self.steam_promotions(limit=limit, parameters={})
-        if action in ("open", "open_app"):
-            return await self.steam_open_app(game=game, confirm_code=confirm_code, parameters={})
-        if action in ("capture", "screenshot"):
-            return await self.game_capture()
-        if action in ("watch", "monitor"):
-            return await self.watch_game(on=on, interval=interval, parameters={})
-        if action in ("summary", "state"):
-            return await self.game_state_summary()
-        if action in ("control", "take_control"):
-            return await self.take_control(on=on, grant_code=grant_code, parameters={})
-        if action in ("action", "operate"):
-            return await self.game_action(
-                action=sub_action,
-                x=click_x, y=click_y, key=key, text=text, parameters={},
-            )
+            ),
+            "promo": lambda: self.steam_promotions(limit=limit, parameters={}),
+            "open": lambda: self.steam_open_app(
+                game=game, confirm_code=confirm_code, parameters={}
+            ),
+            "capture": lambda: self.game_capture(),
+            "watch": lambda: self.watch_game(on=on, interval=interval, parameters={}),
+            "summary": lambda: self.game_state_summary(),
+            "control": lambda: self.take_control(
+                on=on, grant_code=grant_code, parameters={}
+            ),
+            "action": lambda: self.game_action(
+                action=sub_action, x=click_x, y=click_y,
+                key=key, text=text, parameters={},
+            ),
+        }
+        handler = handlers.get(action)
+        if handler is not None:
+            return await handler()
         return {
             "output": "请指定操作：status/list/launch/account/friends/reply/price/promo/open/capture/watch/summary/control/action。",
             "is_error": True,
@@ -1571,20 +1632,9 @@ def _cred_status_line(status: dict) -> str:
     )
 
 
-_BLOCKED_TARGET_PROCESSES = {
-    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
-    "steamwebhelper.exe", "steam.exe", "explorer.exe", "cmd.exe",
-    "powershell.exe", "pwsh.exe", "windowsterminal.exe", "conhost.exe",
-    "code.exe", "notepad.exe",
-}
-
-
-def _target_allowed(info: dict | None) -> bool:
-    """拒绝把浏览器/终端/资源管理器当成游戏窗口：标题可伪造，进程名是硬边界。"""
-    if not info:
-        return False
-    process = str(info.get("process") or "").strip().casefold()
-    return process not in _BLOCKED_TARGET_PROCESSES
+def _target_allowed(info: dict | None, process_name: str = "") -> bool:
+    """复用 control 的唯一进程门禁，并叠加可选的精确进程名限制。"""
+    return control.is_game_like(info, process_name=process_name)
 
 
 _VK_NAMED = {

@@ -13,6 +13,7 @@ v0.4.8 修复部分键鼠注入后的补偿抬起、好友概要缺失时的匹�
 v0.4.9 补回测试侧 `patch_module_clock` fixture，修复 v0.4.6 总预算用例因 fixture 缺失导致的套件 1 error；产品代码无改动。
 v0.4.10 按增量复审修：点击改用授权后实时前台窗口 rect（不再用授权时的旧坐标）；确认码推送只看 `submitted=True`，被拒不再谎报已推送；窗口/前台/画面检查全部通过后才消费授权码；监控线程 `start()` 返回是否真正启动，没起来不报已开启；窗口匹配枚举全部标题命中并先过滤浏览器/终端再取第一个；补 DPI 失败日志、缺 x/y 不再默认点 (0,0)、HTTP 私有 socket 属性取不到时退回读取后检查 deadline；好友候选/时间线/游戏名/商店名统一 `_untrusted` 定界；`plugin.toml` 与 `pyproject.toml` 版本改由测试同步校验。
 v0.4.11 修市场验证失败：测试时钟改为只替换被测模块自己的 `time` 名字，不再全局篡改 stdlib `time.monotonic`；`patch_module_clock` fixture 仍保持原有调用方式。
+v0.4.12 修复缺失坐标误点、空标题配置不生效、找不到游戏时回退前台窗口、浏览器打开失败误报、聊天响应无上限、Cookie 跨域重定向泄露风险与完整窗口矩形坐标偏差；DPI Awareness 改为首次真实截图/输入时延迟幂等设置。新增 `require_friend_confirm` 与 `game_process`，确认状态机拆分为 `confirmation.py`，入口改为查表分发。
 
 ## 功能
 
@@ -73,14 +74,23 @@ v0.4.11 修市场验证失败：测试时钟改为只替换被测模块自己的
 ## 安全说明
 
 - 后台监控默认关闭，用户要求才开启；仅保留最近 40 个帧文件（PNG/BMP 混合），且 120 秒内不删，避免删掉视觉通道正在读取的截图
-- 键鼠接管默认关闭，必须玩家显式授权；只作用于绑定的游戏窗口且每次操作前复核前台；浏览器/终端/资源管理器进程一律拒绝；每步操作记入时间线
+- 键鼠接管默认关闭，必须玩家显式授权；只作用于绑定的游戏窗口且每次操作前复核前台；浏览器/终端/资源管理器进程一律拒绝；找不到标题/进程匹配的游戏窗口时直接拒绝，不回退前台窗口；每步操作记入时间线
+- 点击使用真实客户区 `GetClientRect` + `ClientToScreen` 坐标；DPI Awareness 不在 import 时修改，而是在首次真实截图/输入前延迟、幂等设置
 - 只读取本地库元数据与屏幕画面；API Key / cookie 用 DPAPI 加密保存、日志与会话输出经过脱敏
-- 不自动探测浏览器 Cookie；凭证只能由用户手动粘贴配置，验证通过后才落盘
+- 不自动探测浏览器 Cookie；凭证只能由用户手动粘贴配置，验证通过后才落盘。Cookie 校验/发送请求只在允许的 Valve HTTPS 域名间重定向时保留 Cookie，跨域或降级 HTTP 会移除
+- **凭证经过模型的风险属于宿主边界**：手动把 Key/Cookie 发给 YUI 时，凭证会经过宿主模型与对话链路；DPAPI 只保护落盘数据，并未消除这一风险。请仅在可信宿主/模型环境中配置，必要时及时轮换凭证
 - 回复好友属于对外写操作，仅在用户明确要求时发送；精确昵称或 17 位 SteamID 匹配，纯数字不按子串猜人
-- 昵称仅子串匹配、好友概要部分失败、或无 Key 直发 SteamID 时，插件把 6 位 `confirm_code` 推送到用户界面，用户读出后才能发送；未安装游戏打开商店页前同样需要确认码
+- 昵称仅子串匹配、好友概要部分失败、或无 Key 直发 SteamID 时，插件把 6 位 `confirm_code` 推送到用户界面，用户读出后才能发送；`steam.require_friend_confirm=true` 可强制所有发送（含精确匹配）都确认；未安装游戏打开商店页前同样需要确认码
 - 开启键鼠接管前，插件把 6 位 `grant_code` 推送到用户界面；工具结果不返回任何码，模型不能自行授权。接管绑定具体游戏窗口，窗口切走/最小化立即失效
+- Steam 旧网页聊天接口的 401/403 诊断为 Cookie 失效，404/405/410 诊断为接口不可用/可能下线；本轮未做带真实凭证的实机聊天验证
 - 打包排除：`pyproject.toml` 的 `[tool.neko.build] exclude_files` 明确排除 `steam_api_key.txt`、`steam_cookie.txt`、`*.tmp`
-- 不修改任何 Steam 配置；全部标准库 + ctypes 实现，无第三方依赖
+- 不修改任何 Steam 配置
+
+## 依赖与降级
+
+- Win32 窗口、截图与输入调用使用 Python 标准库 `ctypes`；项目声明唯一第三方运行时依赖 **Pillow（导入名 `PIL`）**，见 `pyproject.toml`
+- Pillow 用于 GDI 像素的 PNG 编码、BMP→PNG 转换，以及超大截图缩放为 JPEG；不可用时 GDI 截图回退为标准库写入 BMP，BMP 转 PNG 失败会保留 BMP
+- 超大截图在无法使用 Pillow 缩图时不能生成视觉 `images` 条目，会记录警告；其他本地游戏库、价格等不依赖图像编码的功能不受影响
 
 ## 安装路径识别
 
@@ -91,9 +101,21 @@ v0.4.11 修市场验证失败：测试时钟改为只替换被测模块自己的
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `steam.game_window_title` | `civilization vi` | 游戏助手优先查找的窗口标题片段（不区分大小写），其他游戏可改此项 |
+| `steam.game_window_title` | `civilization vi` | 游戏助手优先查找的窗口标题片段（不区分大小写）；键存在且留空时不做 PrintWindow 直抓，只截取进程匹配的前台窗口 |
+| `steam.game_process` | 空 | 可选的窗口进程名精确匹配（不区分大小写），如 `factorio.exe`；切换游戏时建议与标题一并修改 |
+| `steam.require_friend_confirm` | `false` | 设为 `true` 时，所有好友发送（含精确昵称/SteamID）都必须经过用户界面确认码 |
 | `STEAM_MANAGER_DATA_DIR` | `%LOCALAPPDATA%\N.E.K.O\steam_manager` | 凭证加密存储目录覆盖 |
 | `STEAM_API_KEY` | 无 | 环境变量优先于本地配置文件 |
+
+切换到其他游戏的配置示例：
+
+```toml
+[steam]
+game_window_title = "factorio"
+game_process = "factorio.exe"
+```
+
+完整注释见 `config.example.toml`。
 
 ## 开发与构建
 
@@ -105,4 +127,16 @@ set NEKO_SOURCE_ROOT=C:\path\to\N.E.K.O
 python -m pytest tests -q
 # 发布前检查
 python -m plugin.neko_plugin_cli.cli check -r steam_manager
+# 同步 pyproject.toml 中声明的依赖到 vendor/
+python -m plugin.neko_plugin_cli.cli sync steam_manager --clean
+# 构建插件包
+python -m plugin.neko_plugin_cli.cli build steam_manager
 ```
+
+### v0.4.12 本地验证结果
+
+- 在隔离的官方宿主挂载副本中运行完整测试：**147 passed in 2.69s**，其中包含真实 `build_plugin` 打包与凭证排除用例
+- `ruff check . --exclude .venv`：**All checks passed**；`git diff --check`：通过
+- 官方 `check -r steam_manager`：**check --release passed**，版本 `0.4.12`，测试通过，payload hash 校验通过；隔离挂载副本没有独立 Git 仓库，因此检查器给出对应提示
+- 官方 `build steam_manager`：**built=1, failed=0**；另行读取构建包确认两个清单版本均为 `0.4.12`、包含 `vendor/` 中的 Pillow，且不含 API Key、Cookie、`.tmp`、`.git` 或 `.venv` 文件
+- 未使用真实 Steam 凭证做旧网页聊天实机验证；相关 HTTP 状态码分支由模拟回归测试覆盖

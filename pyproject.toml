@@ -1,7 +1,7 @@
 [project]
 name = "steam_manager"
-version = "0.4.11"
-dependencies = []
+version = "0.4.12"
+dependencies = ["Pillow>=10"]
 
 [tool.neko.build]
 # 实际构建（check -r / build / release）读取 [tool.neko.build]；凭证文件绝不能进包。

@@ -239,6 +239,7 @@ def test_game_action_click_reports_input_failed(monkeypatch) -> None:
     inst._state.note_frame(target, r"C:\tmp\frame.bmp")
     assert inst._state.enable_control(target) is True
     monkeypatch.setattr(control, "get_foreground_window_info", lambda: target)
+    monkeypatch.setattr(control, "window_client_to_screen", lambda _info, _x, _y: (10, 20))
     monkeypatch.setattr(control, "mouse_click_abs", lambda x, y: False)
 
     result = _run(inst.game_action(action="click", x=10, y=20, parameters={}))
@@ -470,14 +471,14 @@ def test_send_message_includes_sessionid_and_checks_sender(monkeypatch) -> None:
         def __exit__(self, *args):
             return False
 
-        def read(self):
+        def read(self, _size=-1):
             return b"[1, true]"
 
     def _urlopen(req, timeout=None):
         captured.append({"body": req.data.decode(), "timeout": timeout})
         return _Resp()
 
-    monkeypatch.setattr(steam.urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(steam, "_open_cookie_request", _urlopen)
     cookie = "sessionid=abc; steamLoginSecure=76561198000000001%7C%7Ctoken"
     result = steam.send_friend_message(cookie, "76561198000000001", "76561198000000002", "hi")
     assert result["ok"] is True

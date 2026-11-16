@@ -125,17 +125,29 @@ def test_parse_vk() -> None:
 # ══════════ 坐标换算 ══════════
 
 
-def test_window_client_to_screen() -> None:
-    from plugin.plugins.steam_manager.control import window_client_to_screen
+def test_window_client_to_screen(monkeypatch) -> None:
+    from plugin.plugins.steam_manager import control
 
-    win = _fake_window()  # rect (100,100)-(500,400) → w=400 h=300
-    sx, sy = window_client_to_screen(win, 500, 500)
-    assert sx == 300
-    assert sy == 250
-    sx, sy = window_client_to_screen(win, 0, 0)
-    assert (sx, sy) == (100, 100)
-    sx, sy = window_client_to_screen(win, 1000, 1000)
-    assert (sx, sy) == (499, 399)  # right/bottom 是排他边界，不能落在窗口外
+    class _User32:
+        @staticmethod
+        def GetClientRect(_hwnd, ptr):
+            rect = ptr._obj
+            rect.left, rect.top, rect.right, rect.bottom = (0, 0, 400, 300)
+            return 1
+
+        @staticmethod
+        def ClientToScreen(_hwnd, ptr):
+            ptr._obj.x, ptr._obj.y = (100, 100)
+            return 1
+
+    monkeypatch.setattr(control, "USER32", _User32())
+    monkeypatch.setattr(control, "_ensure_dpi_awareness", lambda: None)
+    monkeypatch.setattr(control, "_screen_bounds", lambda: (0, 0, 2000, 1200))
+    win = _fake_window()
+    assert control.window_client_to_screen(win, 500, 500) == (300, 250)
+    assert control.window_client_to_screen(win, 0, 0) == (100, 100)
+    # right/bottom 是排他边界，不能落在客户区外。
+    assert control.window_client_to_screen(win, 1000, 1000) == (499, 399)
 
 
 # ══════════ BMP 写入（字节校验） ══════════
