@@ -16,6 +16,7 @@ v0.4.11 修市场验证失败：测试时钟改为只替换被测模块自己的
 v0.4.12 修复缺失坐标误点、空标题配置不生效、找不到游戏时回退前台窗口、浏览器打开失败误报、聊天响应无上限、Cookie 跨域重定向泄露风险与完整窗口矩形坐标偏差；DPI Awareness 改为首次真实截图/输入时延迟幂等设置。新增 `require_friend_confirm` 与 `game_process`，确认状态机拆分为 `confirmation.py`，入口改为查表分发。
 v0.4.13 修复 v0.4.12 发布检查中 DPI 测试直接访问 Windows 专有 `ctypes.windll` 导致的 Linux 失败；Pillow 改为明确使用 N.E.K.O 宿主已提供的运行库，不再让 Ubuntu CI 将 Windows 插件依赖替换为 Linux 二进制，并移除已提交的平台相关 vendor。
 v0.4.14 增量深审修复：截图与点击统一到客户区基准（BitBlt 用客户区屏幕原点、PrintWindow 加 `PW_CLIENTONLY`），窗口化游戏不再整体偏移；标题与 `game_process` 都为空时拒绝截图/监控；DPI 设置检查返回值，返回 0 时继续尝试下一个 API 且先设置再取窗口矩形；发送请求已出站但读响应断链归 `SEND_UNCERTAIN`，提示可能已送达、不要直接重试；`note_event` 不再预套 `_untrusted`，避免展示时叠两层定界符。
+v0.4.15 增量深审（A707）修复：设置 DPI 前先查询现状，宿主已感知即算成功、不再打两条误导性警告；客户区宽或高为 0 时直接判“不可用”，不再用 `max(1, …)` 凑出 1×1 截图当成功；只配置 `game_process`（标题留空）时接管也能按进程名绑定目标窗口，标题与进程都为空返回 `WINDOW_TARGET_REQUIRED`；连接阶段断链的提示不再断言“已到达 Steam”，改说无法确认并提示先核实再重发；`tests/test_v0413_regression.py` 更名为 `test_v0414_regression.py`。
 
 ## 功能
 
@@ -105,7 +106,7 @@ v0.4.14 增量深审修复：截图与点击统一到客户区基准（BitBlt �
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `steam.game_window_title` | `civilization vi` | 游戏助手优先查找的窗口标题片段（不区分大小写）；键存在且留空时不做 PrintWindow 直抓，只截取进程匹配的前台窗口 |
-| `steam.game_process` | 空 | 可选的窗口进程名精确匹配（不区分大小写），如 `factorio.exe`；切换游戏时建议与标题一并修改 |
+| `steam.game_process` | 空 | 可选的窗口进程名精确匹配（不区分大小写），如 `factorio.exe`；切换游戏时建议与标题一并修改。v0.4.15 起只填这一项（标题留空）也能截图/监控/接管：接管按该进程的可见窗口绑定目标 |
 | `steam.require_friend_confirm` | `false` | 设为 `true` 时，所有好友发送（含精确昵称/SteamID）都必须经过用户界面确认码 |
 | `STEAM_MANAGER_DATA_DIR` | `%LOCALAPPDATA%\N.E.K.O\steam_manager` | 凭证加密存储目录覆盖 |
 | `STEAM_API_KEY` | 无 | 环境变量优先于本地配置文件 |
@@ -161,3 +162,13 @@ python -m plugin.neko_plugin_cli.cli build steam_manager
 - `note_event` 不再预先套 `_untrusted`，避免 `game_state_summary` 展示时叠出两层定界符
 - Windows 完整测试：**158 passed in 8.06s**；`ruff check . --exclude .venv`：**All checks passed**
 - 未在真实 Steam 客户端与真实游戏窗口上复跑截图/点击；客户区换算与拒绝分支由离线回归覆盖
+
+### v0.4.15 增量深审修复（A707）
+
+- DPI 已感知被误判：宿主进程本来已 DPI 感知时两个 Set API 都返回 0，旧实现记 `/warning` 说“没有可用的 API”。现先查 `GetThreadDpiAwarenessContext` + `GetAwarenessFromDpiAwarenessContext`（缺失时退回 `IsProcessDPIAware`），已感知直接算成功，不再调 Set、不再报警告
+- 零尺寸客户区：`_client_screen_rect` 去掉 `max(1, …)` 兜底，宽或高 ≤0 直接返回 `None`，截图/点击走已有“客户区不可用”拒绝分支，不再产出一张 1×1 空白 PNG 当成功
+- 纯进程名接管：`control.find_window_by_title` 支持“标题空 + 进程名”匹配可见窗口（仍过 `is_game_like` 黑名单）；`take_control` 不再因标题为空直接 `NO_WINDOW`，标题与进程都为空时明确返回 `WINDOW_TARGET_REQUIRED`，找不到目标仍然拒绝、不回退前台窗口
+- 发送歧义文案：`urllib` 无法区分“连接阶段超时/重置”和“已出站后断链”，仍按最保守的 `SteamSendUncertain` 处理（不自动重发），但文案改说“无法确认是否送达，请先核实”，不再断言请求已到达 Steam
+- 测试文件归位：`tests/test_v0413_regression.py` → `tests/test_v0414_regression.py`（内容本就是 v0.4.14 的回归）
+- Windows 完整测试：**172 passed in 9.23s**（新增 `tests/test_v0415_regression.py` 14 项）；`ruff check .`：**All checks passed**
+- 仍未在真实 Steam 客户端、真实游戏窗口与真实 Steam 聊天接口上复跑；本机没有游戏窗口，DPI 查询、进程名匹配、零尺寸拒绝与发送文案均由 monkeypatch 离线用例覆盖，不代表实机验证通过

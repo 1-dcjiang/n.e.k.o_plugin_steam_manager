@@ -1359,7 +1359,18 @@ class SteamManagerPlugin(NekoPluginBase):
             }
         hint = (self._game_window_title or "").strip()
         process_name = getattr(self, "_game_process", "")
-        target = await self._find_game_window(hint) if hint else None
+        if not hint and not process_name:
+            return {
+                "output": (
+                    "未配置 steam.game_window_title，也未配置 steam.game_process；"
+                    "接管需要明确的目标游戏窗口，已拒绝。请先配置游戏窗口标题或精确进程名。"
+                ),
+                "is_error": True,
+                "error": "WINDOW_TARGET_REQUIRED",
+            }
+        # v0.4.15：只配置进程名时也要能接管。原来 hint 为空就直接 NO_WINDOW，
+        # 而截图/监控都支持“仅进程名+前台过滤”，接管行为与它们不一致。
+        target = await self._find_game_window(hint)
         fg = await asyncio.to_thread(control.get_foreground_window_info)
         # 找不到标题/进程匹配的游戏时必须拒绝，绝不能把当前前台窗口当作兜底目标。
         if not target:

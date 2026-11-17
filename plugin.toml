@@ -4,7 +4,7 @@ name = "Steam管理"
 description = "让 YUI 管理本地 Steam 客户端与游戏库，并充当游戏助手与 Steam 账号助手：查询客户端状态、列出与启动已安装游戏；截取游戏画面、后台监控并汇总局面；用户显式授权后接管键鼠；查询账号、好友、价格与促销，回复好友，打开游戏。凭证用 DPAPI 加密保存，写操作需要用户确认，输入或截图失败不会报告成功。"
 short_description = "Steam 游戏库/账号/好友/价格助手 + 截图读局与代打；凭证 DPAPI 加密、确认码推送用户界面、接管绑定前台游戏窗口、20s 网络总预算"
 keywords = ["steam", "游戏", "游戏库", "启动", "launch", "appid", "library", "库", "客户端", "game", "截图", "capture", "监控", "watch", "接管", "control", "操作", "辅助", "建议", "助手", "游戏助手", "代打", "账号", "account", "好友", "friend", "消息", "message", "价格", "price", "促销", "折扣", "特惠", "promotion", "steam community", "商店"]
-version = "0.4.14"
+version = "0.4.15"
 type = "plugin"
 entry = "plugin.plugins.steam_manager:SteamManagerPlugin"
 

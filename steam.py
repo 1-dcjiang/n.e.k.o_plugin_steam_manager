@@ -1049,8 +1049,12 @@ def send_friend_message(cookie: str, my_steam_id: str, friend_steam_id: str, tex
                 http.client.HTTPException,
             ),
         ):
+            # v0.4.15：urllib 把“连接阶段超时/重置”和“已出站后发送失败”都包成
+            # URLError，Python 侧无法区分，故一律按最保守的“可能已送达”处理，
+            # 但文案不再断言请求一定发出去了，避免把连接失败说成“已到达 Steam”。
             raise SteamSendUncertain(
-                "发送结果不确定：请求可能已到达 Steam，但读取响应时连接断开"
+                "发送结果不确定：连接在发送/读取响应阶段断开，无法确认消息是否已送达 Steam；"
+                "请先让用户到 Steam 聊天里核实，不要直接重发"
             ) from exc
         raise ValueError(f"发送失败（网络错误）：{redact_text(reason)}") from exc
     except http.client.HTTPException as exc:

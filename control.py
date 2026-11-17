@@ -235,11 +235,39 @@ _DPI_AWARENESS_ATTEMPTED = False
 _DPI_AWARE = False
 
 
+def _is_dpi_aware() -> bool:
+    """查询当前进程是否**已经**处于 DPI 感知状态（不是“设置成功”）。
+
+    ``SetProcessDpiAwarenessContext`` / ``SetProcessDPIAware`` 在宿主已经设过、
+    权限不足或 API 不可用时都返回 0；只看返回值会把“本来就已经感知”当成失败。
+    Win10 1607+ 先查线程上下文（UNAWARE=0 / SYSTEM=1 / PER_MONITOR=2，
+    取不到上下文时为 ``DPI_AWARENESS_INVALID=-1``），老系统退回
+    ``IsProcessDPIAware``（Vista 起可用，感知过就返回 True）。
+    """
+    if USER32 is None:
+        return False
+    ctx_fn = getattr(USER32, "GetThreadDpiAwarenessContext", None)
+    awareness_fn = getattr(USER32, "GetAwarenessFromDpiAwarenessContext", None)
+    if ctx_fn is not None and awareness_fn is not None:
+        try:
+            return int(awareness_fn(ctx_fn())) > 0
+        except (OSError, AttributeError, TypeError, ValueError, ctypes.ArgumentError):
+            pass
+    legacy = getattr(USER32, "IsProcessDPIAware", None)
+    if legacy is not None:
+        try:
+            return bool(legacy())
+        except (OSError, AttributeError, TypeError, ctypes.ArgumentError):
+            pass
+    return False
+
+
 def _ensure_dpi_awareness() -> bool:
     """首次真实截图/输入前延迟设置一次，不在插件 import 时改宿主全局状态。
 
-    返回是否确认设置成功：两个 Win32 API 都返回 0（例如权限不足或已被宿主设置）
-    时不能把“没有抛异常”当成成功，否则高分屏下截图/点击会继续按旧缩放换算。
+    返回是否确认已生效：先查询现状（``_is_dpi_aware``），宿主已经设过就直接算成功；
+    否则依次尝试两个 Win32 API。两者都返回 0（权限不足或 API 缺失）时不能把
+    “没有抛异常”当成成功，否则高分屏下截图/点击会继续按旧缩放换算。
     """
     global _DPI_AWARENESS_ATTEMPTED, _DPI_AWARE
     if USER32 is None:
@@ -250,6 +278,12 @@ def _ensure_dpi_awareness() -> bool:
         if _DPI_AWARENESS_ATTEMPTED:
             return _DPI_AWARE
         _DPI_AWARENESS_ATTEMPTED = True
+        # v0.4.15：宿主（或别的插件）可能已经设过感知，此时两个 Set* 都会返回 0
+        # ——0 只表示“没设成”，不代表没有感知。旧实现在这里把“已感知”误判成
+        # 失败并打两条误导性警告，故先查询现状，已感知直接算成功。
+        if _is_dpi_aware():
+            _DPI_AWARE = True
+            return True
         for name, value in (
             ("SetProcessDpiAwarenessContext", -4),
             ("SetProcessDPIAware", None),
@@ -278,10 +312,12 @@ def _ensure_dpi_awareness() -> bool:
 
 
 def _client_screen_rect(info: dict | int | None) -> tuple[int, int, int, int] | None:
-    """返回窗口客户区的屏幕矩形 (left, top, right, bottom)。
+    """返回窗口客户区的屏幕矩形 (left, top, right, bottom)；不可用返回 None。
 
     ``GetWindowRect`` 包含标题栏/边框，而点击用的是 ``GetClientRect +
     ClientToScreen``；截图也必须用同一客户区基准，否则窗口化游戏会整体偏移。
+    v0.4.15：宽或高 ≤0（异常零尺寸窗口）判为不可用，绝不靠 ``max(1, …)``
+    凑出一张 1×1 的“截图”当成功返回。
     """
     if USER32 is None:
         return None
@@ -298,8 +334,11 @@ def _client_screen_rect(info: dict | int | None) -> tuple[int, int, int, int] | 
         return None
     if not got_rect or not got_origin:
         return None
-    width = max(1, client_rect.right - client_rect.left)
-    height = max(1, client_rect.bottom - client_rect.top)
+    width = client_rect.right - client_rect.left
+    height = client_rect.bottom - client_rect.top
+    if width <= 0 or height <= 0:
+        _logger.warning("窗口客户区尺寸无效（%s×%s），按不可用处理", width, height)
+        return None
     return (
         client_origin.x,
         client_origin.y,
@@ -473,12 +512,17 @@ def find_window_by_title(title_hint: str, process_name: str = "") -> dict | None
     先枚举**所有**标题匹配的窗口，逐个取进程名过滤掉浏览器/终端/资源管理器，
     再返回第一个通过过滤的窗口；不再“枚举到第一个标题匹配就停”，避免浏览器
     挡在游戏前面时截图/监控/接管全部找不到游戏。
+
+    v0.4.15：标题为空、只给了 ``process_name`` 时按进程名匹配可见窗口（等价于
+    “该进程的任意游戏窗口”），让“只配置 ``steam.game_process``”的配置对接管也
+    成立；两者都为空仍然拒绝枚举，避免随便绑到一个前台窗口。
     """
     if USER32 is None:
         return None
     _ensure_dpi_awareness()
     hint = (title_hint or "").strip().casefold()
-    if not hint:
+    expected_process = str(process_name or "").strip()
+    if not hint and not expected_process:
         return None
     found: list[int] = []
 
@@ -488,7 +532,7 @@ def find_window_by_title(title_hint: str, process_name: str = "") -> dict | None
             title_buf = ctypes.create_unicode_buffer(512)
             USER32.GetWindowTextW(hwnd, title_buf, 512)
             title = title_buf.value or ""
-            if hint in title.casefold():
+            if not hint or hint in title.casefold():
                 found.append(hwnd)
         return True
 
