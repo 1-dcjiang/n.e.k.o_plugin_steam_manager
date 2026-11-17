@@ -1,7 +1,8 @@
 [steam]
 # 游戏助手优先查找的窗口标题片段（不区分大小写）。
 # 玩其他游戏时改成对应窗口标题，例如 "factorio"、"terraria"。
-# 配置键存在且留空时不做 PrintWindow 直抓，只截取进程匹配的前台窗口。
+# 配置键存在且留空时不做 PrintWindow 直抓，只截取进程匹配的前台窗口；
+# 若 game_process 也为空，则拒绝截图/监控，避免截取任意前台窗口（含聊天/密码管理器）。
 game_window_title = "civilization vi"
 
 # 可选：进一步要求窗口进程名精确匹配（Windows 下不区分大小写），降低标题误匹配。

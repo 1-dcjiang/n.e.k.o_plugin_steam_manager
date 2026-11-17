@@ -35,6 +35,7 @@ if os.name == "nt":
 
 # ══════════ Win32 常量 ══════════
 
+_PW_CLIENTONLY = 1
 _PW_RENDERFULLCONTENT = 2
 _BI_RGB = 0
 _MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -231,18 +232,24 @@ _configure_win32()
 
 _DPI_LOCK = threading.Lock()
 _DPI_AWARENESS_ATTEMPTED = False
+_DPI_AWARE = False
 
 
-def _ensure_dpi_awareness() -> None:
-    """首次真实截图/输入前延迟设置一次，不在插件 import 时改宿主全局状态。"""
-    global _DPI_AWARENESS_ATTEMPTED
-    if USER32 is None or _DPI_AWARENESS_ATTEMPTED:
-        return
+def _ensure_dpi_awareness() -> bool:
+    """首次真实截图/输入前延迟设置一次，不在插件 import 时改宿主全局状态。
+
+    返回是否确认设置成功：两个 Win32 API 都返回 0（例如权限不足或已被宿主设置）
+    时不能把“没有抛异常”当成成功，否则高分屏下截图/点击会继续按旧缩放换算。
+    """
+    global _DPI_AWARENESS_ATTEMPTED, _DPI_AWARE
+    if USER32 is None:
+        return False
+    if _DPI_AWARENESS_ATTEMPTED:
+        return _DPI_AWARE
     with _DPI_LOCK:
         if _DPI_AWARENESS_ATTEMPTED:
-            return
+            return _DPI_AWARE
         _DPI_AWARENESS_ATTEMPTED = True
-        dpi_aware = False
         for name, value in (
             ("SetProcessDpiAwarenessContext", -4),
             ("SetProcessDPIAware", None),
@@ -251,35 +258,63 @@ def _ensure_dpi_awareness() -> None:
             if fn is None:
                 continue
             try:
-                if value is None:
-                    fn()
-                else:
-                    fn(ctypes.c_void_p(value))
-                dpi_aware = True
-                break
+                result = fn() if value is None else fn(ctypes.c_void_p(value))
             except (OSError, AttributeError, ctypes.ArgumentError) as exc:
                 _logger.warning("设置 DPI awareness 失败（%s）：%s", name, exc)
-        if not dpi_aware:
+                continue
+            if result:
+                _DPI_AWARE = True
+                break
+            _logger.warning("设置 DPI awareness 返回 0（%s），继续尝试下一个 API", name)
+        if not _DPI_AWARE:
             _logger.warning(
                 "没有可用的 DPI awareness API：高分屏下窗口坐标/点击位置可能被系统缩放，"
                 "截图与点击需要按实际 DPI 复核"
             )
+        return _DPI_AWARE
 
 
 # ══════════ 窗口与进程信息 ══════════
 
 
-def _safe_call(fn, *args, default=None):
+def _client_screen_rect(info: dict | int | None) -> tuple[int, int, int, int] | None:
+    """返回窗口客户区的屏幕矩形 (left, top, right, bottom)。
+
+    ``GetWindowRect`` 包含标题栏/边框，而点击用的是 ``GetClientRect +
+    ClientToScreen``；截图也必须用同一客户区基准，否则窗口化游戏会整体偏移。
+    """
+    if USER32 is None:
+        return None
+    hwnd = info.get("hwnd") if isinstance(info, dict) else info
+    if not hwnd:
+        return None
+    client_rect = _Rect()
+    client_origin = wt.POINT(0, 0)
     try:
-        return fn(*args)
-    except (OSError, AttributeError, ValueError, TypeError, ctypes.ArgumentError):
-        return default
+        got_rect = USER32.GetClientRect(hwnd, ctypes.byref(client_rect))
+        got_origin = USER32.ClientToScreen(hwnd, ctypes.byref(client_origin))
+    except (OSError, AttributeError, ValueError, TypeError, ctypes.ArgumentError) as exc:
+        _logger.warning("读取窗口客户区失败：%s", exc)
+        return None
+    if not got_rect or not got_origin:
+        return None
+    width = max(1, client_rect.right - client_rect.left)
+    height = max(1, client_rect.bottom - client_rect.top)
+    return (
+        client_origin.x,
+        client_origin.y,
+        client_origin.x + width,
+        client_origin.y + height,
+    )
 
 
 def get_foreground_window_info() -> dict | None:
-    """返回前台窗口信息：{title, pid, process, rect, ts}；无窗口或非 Windows 返回 None。"""
+    """返回前台窗口信息：{title, pid, process, rect, client_rect, ts}；无窗口或非 Windows 返回 None。"""
     if USER32 is None:
         return None
+    # 先设置 DPI awareness，再取 GetWindowRect；否则宿主不是 DPI 感知时首帧
+    # 可能按旧缩放计算，客户端换算与截图区域都会偏。
+    _ensure_dpi_awareness()
     hwnd = USER32.GetForegroundWindow()
     if not hwnd:
         return None
@@ -299,6 +334,7 @@ def get_foreground_window_info() -> dict | None:
         "pid": pid.value,
         "process": process,
         "rect": (rect.left, rect.top, rect.right, rect.bottom),
+        "client_rect": _client_screen_rect(hwnd),
         "ts": time.time(),
     }
 
@@ -326,11 +362,19 @@ def _process_name(pid: int) -> str:
 
 
 def capture_window_bmp(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
-    """截取窗口所在屏幕区域，保存为 BMP，返回文件路径；失败或非 Windows 返回 None。"""
+    """截取窗口客户区，保存为 BMP，返回文件路径；失败或非 Windows 返回 None。
+
+    只抓客户区，与 ``window_client_to_screen`` 的点击基准一致；不再包含标题栏/边框。
+    """
     if USER32 is None or GDI32 is None:
         return None
     _ensure_dpi_awareness()
-    left, top, right, bottom = info["rect"]
+    client = _client_screen_rect(info)
+    if client is None:
+        _logger.warning("窗口客户区不可用，拒绝按整窗矩形截图")
+        return None
+    info["client_rect"] = client
+    left, top, right, bottom = client
     width = max(1, right - left)
     height = max(1, bottom - top)
     hdc_screen = USER32.GetDC(None)
@@ -432,6 +476,7 @@ def find_window_by_title(title_hint: str, process_name: str = "") -> dict | None
     """
     if USER32 is None:
         return None
+    _ensure_dpi_awareness()
     hint = (title_hint or "").strip().casefold()
     if not hint:
         return None
@@ -465,6 +510,7 @@ def find_window_by_title(title_hint: str, process_name: str = "") -> dict | None
             "pid": pid.value,
             "process": _process_name(pid.value),
             "rect": (rect.left, rect.top, rect.right, rect.bottom),
+            "client_rect": _client_screen_rect(hwnd),
             "ts": time.time(),
         }
         if is_game_like(info, process_name=process_name):
@@ -481,21 +527,28 @@ def find_civ6_window() -> dict | None:
 
 
 def capture_window_printwindow(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
-    """PrintWindow 直抓窗口内容，保存为 BMP，返回文件路径；失败返回 None。
+    """PrintWindow 直抓窗口客户区，保存为 BMP，返回文件路径；失败返回 None。
 
     与 capture_window_bmp（屏幕区域截图，被遮挡时截到最上层窗口）的区别：
     PrintWindow 向目标窗口请求绘制，拿到的永远是窗口本体画面——
-    游戏被聊天/终端窗口完全遮挡时也能拿到游戏画面。"""
+    游戏被聊天/终端窗口完全遮挡时也能拿到游戏画面。
+    只抓客户区（PW_CLIENTONLY），与点击的 GetClientRect 基准一致。
+    """
     if USER32 is None or GDI32 is None:
         return None
     _ensure_dpi_awareness()
     hwnd = info.get("hwnd")
     if not hwnd:
         return None
-    left, top, right, bottom = info["rect"]
+    client = _client_screen_rect(info)
+    if client is None:
+        _logger.warning("窗口客户区不可用，拒绝 PrintWindow 整窗截图")
+        return None
+    info["client_rect"] = client
+    left, top, right, bottom = client
     width = max(1, right - left)
     height = max(1, bottom - top)
-    hdc_win = USER32.GetWindowDC(hwnd)
+    hdc_win = USER32.GetDC(hwnd)
     if not hdc_win:
         return None
     try:
@@ -508,8 +561,9 @@ def capture_window_printwindow(info: dict, save_dir: str = _FRAME_DIR) -> str | 
                 return None
             try:
                 old = GDI32.SelectObject(hdc_mem, hbmp)
-                PW_RENDERFULLCONTENT = 2
-                if not USER32.PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT):
+                if not USER32.PrintWindow(
+                    hwnd, hdc_mem, _PW_RENDERFULLCONTENT | _PW_CLIENTONLY
+                ):
                     GDI32.SelectObject(hdc_mem, old)
                     return None
                 bmi = _BitmapInfo()
@@ -696,21 +750,16 @@ def window_client_to_screen(info: dict, rel_x: float, rel_y: float) -> tuple[int
     if USER32 is None or not info.get("hwnd"):
         raise ValueError("当前环境无法读取窗口客户区")
     _ensure_dpi_awareness()
-    client_rect = _Rect()
-    client_origin = wt.POINT(0, 0)
-    try:
-        got_rect = USER32.GetClientRect(info["hwnd"], ctypes.byref(client_rect))
-        got_origin = USER32.ClientToScreen(info["hwnd"], ctypes.byref(client_origin))
-    except (OSError, AttributeError, ValueError, TypeError, ctypes.ArgumentError) as exc:
-        raise ValueError("读取窗口客户区失败") from exc
-    if not got_rect or not got_origin:
+    client = _client_screen_rect(info)
+    if client is None:
         raise ValueError("读取窗口客户区失败")
-    width = max(1, client_rect.right - client_rect.left)
-    height = max(1, client_rect.bottom - client_rect.top)
+    left, top, right, bottom = client
+    width = max(1, right - left)
+    height = max(1, bottom - top)
     rel_x = max(0.0, min(1000.0, float(rel_x)))
     rel_y = max(0.0, min(1000.0, float(rel_y)))
-    sx = client_origin.x + min(width - 1, int(width * rel_x / 1000))
-    sy = client_origin.y + min(height - 1, int(height * rel_y / 1000))
+    sx = left + min(width - 1, int(width * rel_x / 1000))
+    sy = top + min(height - 1, int(height * rel_y / 1000))
     vx, vy, vw, vh = _screen_bounds()
     return (
         max(vx, min(vx + vw - 1, sx)),

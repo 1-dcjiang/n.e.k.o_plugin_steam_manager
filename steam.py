@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import email.utils
+import http.client
 import json
 import logging
 import os
@@ -734,6 +735,10 @@ class SteamResponseTooLarge(ValueError):
     """聊天响应超过硬上限；与 Cookie 失效和网络异常分开诊断。"""
 
 
+class SteamSendUncertain(OSError):
+    """发送请求已出站但响应读取失败：可能已送达，不能直接重试。"""
+
+
 def redact_text(value: object, limit: int = 300) -> str:
     """异常/日志文本脱敏：抹掉 query 里的 key、sessionid、cookie 等。"""
     text = _SECRET_QUERY_RX.sub(r"\1=[redacted]", str(value or ""))
@@ -1033,7 +1038,31 @@ def send_friend_message(cookie: str, my_steam_id: str, friend_steam_id: str, tex
     except urllib.error.HTTPError as exc:
         raise SteamHTTPError(exc.code, str(exc.reason or "")) from exc
     except urllib.error.URLError as exc:
-        raise ValueError(f"发送失败（网络错误）：{redact_text(exc.reason)}") from exc
+        reason = exc.reason
+        if isinstance(
+            reason,
+            (
+                TimeoutError,
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+                http.client.HTTPException,
+            ),
+        ):
+            raise SteamSendUncertain(
+                "发送结果不确定：请求可能已到达 Steam，但读取响应时连接断开"
+            ) from exc
+        raise ValueError(f"发送失败（网络错误）：{redact_text(reason)}") from exc
+    except http.client.HTTPException as exc:
+        raise SteamSendUncertain(
+            f"发送结果不确定：请求可能已到达 Steam，但响应读取失败（{type(exc).__name__}）"
+        ) from exc
+    except OSError as exc:
+        # resp.read() 在请求已出站后才断链时，urllib 不会再包一层 URLError；
+        # 这类错误同样属于“可能已送达”，不能按普通网络失败让模型直接重试。
+        raise SteamSendUncertain(
+            f"发送结果不确定：请求可能已到达 Steam，但读取响应时连接断开（{type(exc).__name__}）"
+        ) from exc
     stripped = raw.strip()
     if stripped.startswith("["):
         try:

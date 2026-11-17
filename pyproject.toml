@@ -1,6 +1,6 @@
 [project]
 name = "steam_manager"
-version = "0.4.13"
+version = "0.4.14"
 # Pillow 由 N.E.K.O 宿主提供；不要让 Ubuntu CI 为 Windows 插件同步 Linux 二进制。
 dependencies = []
 

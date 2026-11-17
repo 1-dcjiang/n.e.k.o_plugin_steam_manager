@@ -60,8 +60,8 @@ v0.3.0 起同时充当 **Steam 账号/商店助手**：账户信息、好友列�
 - 凭证：API Key / cookie 只读取不输出到对话；回复好友仅在用户明确要求时发送
 - 监控：后台截帧**默认关闭**，用户要求跟踪时才开启（间隔最小 1 秒，仅保留最近 40 个帧文件，且 120 秒内不删，避免删掉视觉通道正在读取的截图）
 - 接管：键鼠模拟**默认关闭**；开启前提是有目标游戏窗口的最近画面，且目标必须在前台；浏览器/终端/资源管理器进程一律拒绝；找不到标题/进程匹配的游戏窗口时直接拒绝，不回退前台窗口；接管只作用于绑定的那个游戏窗口，每次动作前复核前台，窗口切走/最小化立即失效；每次动作都记录进时间线；用户可随时要求交还，civ6 运营锁期间也能立即停车
-- 游戏窗口：默认匹配标题含 `civilization vi`；可用 `steam.game_window_title` 改标题，并用 `steam.game_process` 指定精确进程名（如 `factorio.exe`，不区分大小写）。标题键存在且留空时不做 PrintWindow 直抓，只截取进程匹配的前台窗口
-- 点击：`x/y` 是游戏**客户区**相对千分比（0–1000），不包含标题栏和边框；通过真实 `GetClientRect` + `ClientToScreen` 换算，换算失败时拒绝点击
+- 游戏窗口：默认匹配标题含 `civilization vi`；可用 `steam.game_window_title` 改标题，并用 `steam.game_process` 指定精确进程名（如 `factorio.exe`，不区分大小写）。标题键存在且留空时不做 PrintWindow 直抓，只截取进程匹配的前台窗口；标题和 `game_process` 都为空时拒绝截图/监控，避免把任意前台窗口发给模型
+- 点击：`x/y` 是游戏**客户区**相对千分比（0–1000），不包含标题栏和边框；通过真实 `GetClientRect` + `ClientToScreen` 换算，换算失败时拒绝点击。截图也使用同一个客户区矩形（BitBlt 用客户区屏幕原点，PrintWindow 用 `PW_CLIENTONLY`），模型按截图估坐标再点击不会整体偏移
 - DPI：不在导入插件时修改进程 DPI Awareness，而是在首次真实截图或键鼠输入前延迟、加锁、幂等设置
 - 不自动探测浏览器 Cookie；凭证只能手动粘贴配置，并以 DPAPI 加密保存；验证通过后才写入。手动把 Key/Cookie 发给 YUI 时，凭证会经过宿主模型与对话链路，DPAPI 只保护落盘数据；请仅在可信宿主/模型环境中配置
 - Cookie 校验/发送请求只在 `steamcommunity.com`、`steampowered.com` 及其子域的 HTTPS 跳转间保留 Cookie，跨域或降级 HTTP 会移除 Cookie/Origin；聊天响应限制为 64 KiB

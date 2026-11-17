@@ -15,6 +15,7 @@ v0.4.10 按增量复审修：点击改用授权后实时前台窗口 rect（不�
 v0.4.11 修市场验证失败：测试时钟改为只替换被测模块自己的 `time` 名字，不再全局篡改 stdlib `time.monotonic`；`patch_module_clock` fixture 仍保持原有调用方式。
 v0.4.12 修复缺失坐标误点、空标题配置不生效、找不到游戏时回退前台窗口、浏览器打开失败误报、聊天响应无上限、Cookie 跨域重定向泄露风险与完整窗口矩形坐标偏差；DPI Awareness 改为首次真实截图/输入时延迟幂等设置。新增 `require_friend_confirm` 与 `game_process`，确认状态机拆分为 `confirmation.py`，入口改为查表分发。
 v0.4.13 修复 v0.4.12 发布检查中 DPI 测试直接访问 Windows 专有 `ctypes.windll` 导致的 Linux 失败；Pillow 改为明确使用 N.E.K.O 宿主已提供的运行库，不再让 Ubuntu CI 将 Windows 插件依赖替换为 Linux 二进制，并移除已提交的平台相关 vendor。
+v0.4.14 增量深审修复：截图与点击统一到客户区基准（BitBlt 用客户区屏幕原点、PrintWindow 加 `PW_CLIENTONLY`），窗口化游戏不再整体偏移；标题与 `game_process` 都为空时拒绝截图/监控；DPI 设置检查返回值，返回 0 时继续尝试下一个 API 且先设置再取窗口矩形；发送请求已出站但读响应断链归 `SEND_UNCERTAIN`，提示可能已送达、不要直接重试；`note_event` 不再预套 `_untrusted`，避免展示时叠两层定界符。
 
 ## 功能
 
@@ -140,7 +141,7 @@ python -m plugin.neko_plugin_cli.cli build steam_manager
 - 在隔离的官方宿主挂载副本中运行完整测试：**147 passed in 2.69s**，其中包含真实 `build_plugin` 打包与凭证排除用例
 - `ruff check . --exclude .venv`：**All checks passed**；`git diff --check`：通过
 - 官方 `check -r steam_manager`：**check --release passed**，版本 `0.4.12`，测试通过，payload hash 校验通过；隔离挂载副本没有独立 Git 仓库，因此检查器给出对应提示
-- 官方 `build steam_manager`：**built=1, failed=0**；另行读取构建包确认两个清单版本均为 `0.4.12`、包含 `vendor/` 中的 Pillow，且不含 API Key、Cookie、`.tmp`、`.git` 或 `.venv` 文件
+- 官方 `build steam_manager`：**built=1, failed=0**；另行读取构建包确认两个清单版本均为 `0.4.12`、包含 `vendor/` 中的 Pillow，且不含 API Key、Cookie、`.tmp`、`.git` 或 `.venv` 文件（**该结论已被 v0.4.13 撤销**：`vendor/` 已移除，Pillow 改由 N.E.K.O 宿主提供，发布包不再包含平台相关二进制）
 - 未使用真实 Steam 凭证做旧网页聊天实机验证；相关 HTTP 状态码分支由模拟回归测试覆盖
 
 ### v0.4.13 发布失败复现与修复验证
@@ -150,3 +151,13 @@ python -m plugin.neko_plugin_cli.cli build steam_manager
 - 两端官方 sync 均为 **no external dependencies to sync**；官方 `check -r steam_manager` 均通过，版本 `0.4.13`、测试通过、payload hash 校验通过
 - 两端官方 `build steam_manager` 均为 **built=1, failed=0**；两个构建包均为 24 个文件，不含私有 vendor、`.pyd`、`.so`、API Key、Cookie、`.tmp`、`.git` 或 `.venv`
 - `ruff check . --exclude .venv`：**All checks passed**；`git diff --check`：通过
+
+### v0.4.14 增量深审修复（A694）
+
+- 截图与点击统一到客户区基准：BitBlt 取 `GetClientRect + ClientToScreen` 的屏幕原点，PrintWindow 改用 `PW_CLIENTONLY`；窗口化游戏不再整体偏移，输出尺寸也按客户区计算
+- 标题与 `game_process` 都为空时拒绝截图与监控（`WINDOW_TARGET_REQUIRED`），不再把任意前台窗口（含聊天/密码管理器）发给模型
+- DPI：`SetProcessDpiAwarenessContext` / `SetProcessDPIAware` 返回 0 不再当成成功，逐个 API 继续尝试；取窗口矩形与查找窗口前先设置，首帧不再按旧缩放换算
+- 发送歧义：请求已出站但读响应阶段断链（`TimeoutError` / `ConnectionResetError` / `http.client.HTTPException`）归 `SteamSendUncertain`，输出 `SEND_UNCERTAIN` 并提示可能已送达、不要直接重试
+- `note_event` 不再预先套 `_untrusted`，避免 `game_state_summary` 展示时叠出两层定界符
+- Windows 完整测试：**158 passed in 8.06s**；`ruff check . --exclude .venv`：**All checks passed**
+- 未在真实 Steam 客户端与真实游戏窗口上复跑截图/点击；客户区换算与拒绝分支由离线回归覆盖
