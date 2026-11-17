@@ -169,6 +169,18 @@ def _configure_win32() -> None:
         _set_sig(USER32.GetWindowThreadProcessId, [wt.HWND, ctypes.POINTER(wt.DWORD)], wt.DWORD)
         _set_sig(USER32.EnumWindows, [_WNDENUMPROC, wt.LPARAM], wt.BOOL)
         _set_sig(USER32.IsWindowVisible, [wt.HWND], wt.BOOL)
+        # v0.4.15：DPI 现状查询。HANDLE 是 64 位指针，不声明签名会被 ctypes 当
+        # c_int 截成 32 位，传回去就成了无效上下文——离线 fake 不校验签名，看不出来。
+        # 这两个 API 只在 Win10 1607+ 存在，老系统用 getattr 跳过。
+        ctx_fn = getattr(USER32, "GetThreadDpiAwarenessContext", None)
+        if ctx_fn is not None:
+            _set_sig(ctx_fn, [], ctypes.c_void_p)
+        awareness_fn = getattr(USER32, "GetAwarenessFromDpiAwarenessContext", None)
+        if awareness_fn is not None:
+            _set_sig(awareness_fn, [ctypes.c_void_p], ctypes.c_int)
+        legacy_aware = getattr(USER32, "IsProcessDPIAware", None)
+        if legacy_aware is not None:
+            _set_sig(legacy_aware, [], wt.BOOL)
         _set_sig(USER32.GetDC, [wt.HWND], ctypes.c_void_p)
         _set_sig(USER32.GetWindowDC, [wt.HWND], ctypes.c_void_p)
         _set_sig(USER32.ReleaseDC, [wt.HWND, ctypes.c_void_p], ctypes.c_int)
@@ -250,7 +262,9 @@ def _is_dpi_aware() -> bool:
     awareness_fn = getattr(USER32, "GetAwarenessFromDpiAwarenessContext", None)
     if ctx_fn is not None and awareness_fn is not None:
         try:
-            return int(awareness_fn(ctx_fn())) > 0
+            ctx = ctx_fn()
+            if ctx:
+                return int(awareness_fn(ctx)) > 0
         except (OSError, AttributeError, TypeError, ValueError, ctypes.ArgumentError):
             pass
     legacy = getattr(USER32, "IsProcessDPIAware", None)
@@ -557,6 +571,16 @@ def find_window_by_title(title_hint: str, process_name: str = "") -> dict | None
             "client_rect": _client_screen_rect(hwnd),
             "ts": time.time(),
         }
+        if not hint:
+            # 纯进程名模式：同一进程通常还有启动器/输入法/隐藏 helper 窗口，它们是
+            # 枚举顺序里的“先到者”。空标题或客户区为 0 的窗口既截不到图也点不准，
+            # 直接跳过，否则接管会绑到一个看不见的副窗口。
+            if not (title_buf.value or "").strip() or info["client_rect"] is None:
+                _logger.info(
+                    "纯进程名匹配：跳过空标题或无客户区的窗口 %r / %s",
+                    info["title"], info["process"] or "unknown",
+                )
+                continue
         if is_game_like(info, process_name=process_name):
             return info
         _logger.info(

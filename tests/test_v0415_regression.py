@@ -205,14 +205,18 @@ def test_click_conversion_rejects_zero_size_client(monkeypatch) -> None:
 
 
 class _ProcessOnlyUser32:
-    """两个可见窗口：Steam 客户端（steam.exe）与游戏（game.exe）。"""
+    """枚举顺序里混入同进程的 helper 窗口：空标题（33）与零客户区（44）。
 
-    titles = {11: "Steam", 22: "Test Game"}
-    pids = {11: 111, 22: 999}
+    真实游戏进程常同时有启动器/输入法/隐藏窗口，纯进程名模式必须跳过它们，
+    否则接管会绑到一个看不见的副窗口。
+    """
+
+    titles = {11: "Steam", 22: "Test Game", 33: "", 44: "Helper"}
+    pids = {11: 111, 22: 999, 33: 999, 44: 999}
 
     @staticmethod
     def EnumWindows(cb, _lparam):
-        for hwnd in (11, 22):
+        for hwnd in (33, 44, 11, 22):
             cb(hwnd, 0)
         return 1
 
@@ -241,8 +245,11 @@ class _ProcessOnlyUser32:
         return 1
 
     @staticmethod
-    def GetClientRect(_hwnd, ptr):
-        ptr._obj.left, ptr._obj.top, ptr._obj.right, ptr._obj.bottom = 0, 0, 400, 280
+    def GetClientRect(hwnd, ptr):
+        if hwnd == 44:
+            ptr._obj.left, ptr._obj.top, ptr._obj.right, ptr._obj.bottom = 0, 0, 0, 0
+        else:
+            ptr._obj.left, ptr._obj.top, ptr._obj.right, ptr._obj.bottom = 0, 0, 400, 280
         return 1
 
     @staticmethod
@@ -256,6 +263,7 @@ def _fake_process_name(pid: int) -> str:
 
 
 def test_find_window_by_process_only_matches_game_window(monkeypatch) -> None:
+    """空标题 helper（33）与零客户区 helper（44）都排在主窗口前面，必须跳过。"""
     from plugin.plugins.steam_manager import control
 
     monkeypatch.setattr(control, "USER32", _ProcessOnlyUser32())
@@ -264,7 +272,9 @@ def test_find_window_by_process_only_matches_game_window(monkeypatch) -> None:
     found = control.find_window_by_title("", "game.exe")
     assert found is not None
     assert found["hwnd"] == 22
+    assert found["title"] == "Test Game"
     assert found["process"] == "game.exe"
+    assert found["client_rect"] == (108, 130, 508, 410)
 
 
 def test_find_window_by_process_only_skips_other_processes(monkeypatch) -> None:

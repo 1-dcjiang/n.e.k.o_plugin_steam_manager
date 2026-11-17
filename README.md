@@ -17,6 +17,7 @@ v0.4.12 修复缺失坐标误点、空标题配置不生效、找不到游戏时
 v0.4.13 修复 v0.4.12 发布检查中 DPI 测试直接访问 Windows 专有 `ctypes.windll` 导致的 Linux 失败；Pillow 改为明确使用 N.E.K.O 宿主已提供的运行库，不再让 Ubuntu CI 将 Windows 插件依赖替换为 Linux 二进制，并移除已提交的平台相关 vendor。
 v0.4.14 增量深审修复：截图与点击统一到客户区基准（BitBlt 用客户区屏幕原点、PrintWindow 加 `PW_CLIENTONLY`），窗口化游戏不再整体偏移；标题与 `game_process` 都为空时拒绝截图/监控；DPI 设置检查返回值，返回 0 时继续尝试下一个 API 且先设置再取窗口矩形；发送请求已出站但读响应断链归 `SEND_UNCERTAIN`，提示可能已送达、不要直接重试；`note_event` 不再预套 `_untrusted`，避免展示时叠两层定界符。
 v0.4.15 增量深审（A707）修复：设置 DPI 前先查询现状，宿主已感知即算成功、不再打两条误导性警告；客户区宽或高为 0 时直接判“不可用”，不再用 `max(1, …)` 凑出 1×1 截图当成功；只配置 `game_process`（标题留空）时接管也能按进程名绑定目标窗口，标题与进程都为空返回 `WINDOW_TARGET_REQUIRED`；连接阶段断链的提示不再断言“已到达 Steam”，改说无法确认并提示先核实再重发；`tests/test_v0413_regression.py` 更名为 `test_v0414_regression.py`。
+v0.4.16 复查补强：给 DPI 查询 API 补齐 ctypes 签名（HANDLE 是 64 位指针，缺签名会按默认 `c_int` 处理）；纯进程名匹配时跳过同进程的空标题与零客户区 helper 窗口，避免接管绑到看不见的副窗口。
 
 ## 功能
 
@@ -172,3 +173,11 @@ python -m plugin.neko_plugin_cli.cli build steam_manager
 - 测试文件归位：`tests/test_v0413_regression.py` → `tests/test_v0414_regression.py`（内容本就是 v0.4.14 的回归）
 - Windows 完整测试：**172 passed in 9.23s**（新增 `tests/test_v0415_regression.py` 14 项）；`ruff check .`：**All checks passed**
 - 仍未在真实 Steam 客户端、真实游戏窗口与真实 Steam 聊天接口上复跑；本机没有游戏窗口，DPI 查询、进程名匹配、零尺寸拒绝与发送文案均由 monkeypatch 离线用例覆盖，不代表实机验证通过
+
+### v0.4.16 联锁复查补强（A707 收口）
+
+- ctypes 签名：`GetThreadDpiAwarenessContext` / `GetAwarenessFromDpiAwarenessContext` / `IsProcessDPIAware` 在 `_configure_win32` 里显式声明（HANDLE 用 `c_void_p`），避免 64 位下按默认 `c_int` 处理；老系统缺函数时用 `getattr` 跳过
+- 纯进程名匹配过滤：`find_window_by_title("" , process)` 跳过同进程的**空标题**窗口与**零客户区**窗口（启动器/输入法/隐藏 helper 常排在主窗口前面），只在标题模式之外生效，标题模式行为不变
+- 真机（本机 Windows user32，非伪造）验证：宿主已 `SetProcessDPIAware` 后 `_is_dpi_aware()` 返回 True、`_ensure_dpi_awareness()` 返回 True 且 **0 次 Set 调用、0 条 warning**；`find_window_by_title("", "N.E.K.O.exe")` 命中真实窗口 `198240`（'Project N.E.K.O.'，客户区 2561×1601），黑名单 `explorer.exe` 与空标题窗口均被跳过；`find_window_by_title("", "")` 返回 None；`window_client_to_screen(500,500)` 得 `(1281, 801)`
+- Windows 完整测试：**172 passed in 4.09s**；`ruff check .`：**All checks passed**；官方 `check -r steam_manager` 通过
+- 仍未在真实 Steam 客户端 / 真实游戏 / 真实聊天接口上验证；上述真机结论只覆盖 Win32 窗口与 DPI 分支
