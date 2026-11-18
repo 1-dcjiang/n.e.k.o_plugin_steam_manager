@@ -18,6 +18,7 @@ v0.4.13 修复 v0.4.12 发布检查中 DPI 测试直接访问 Windows 专有 `ct
 v0.4.14 增量深审修复：截图与点击统一到客户区基准（BitBlt 用客户区屏幕原点、PrintWindow 加 `PW_CLIENTONLY`），窗口化游戏不再整体偏移；标题与 `game_process` 都为空时拒绝截图/监控；DPI 设置检查返回值，返回 0 时继续尝试下一个 API 且先设置再取窗口矩形；发送请求已出站但读响应断链归 `SEND_UNCERTAIN`，提示可能已送达、不要直接重试；`note_event` 不再预套 `_untrusted`，避免展示时叠两层定界符。
 v0.4.15 增量深审（A707）修复：设置 DPI 前先查询现状，宿主已感知即算成功、不再打两条误导性警告；客户区宽或高为 0 时直接判“不可用”，不再用 `max(1, …)` 凑出 1×1 截图当成功；只配置 `game_process`（标题留空）时接管也能按进程名绑定目标窗口，标题与进程都为空返回 `WINDOW_TARGET_REQUIRED`；连接阶段断链的提示不再断言“已到达 Steam”，改说无法确认并提示先核实再重发；`tests/test_v0413_regression.py` 更名为 `test_v0414_regression.py`。
 v0.4.16 复查补强：给 DPI 查询 API 补齐 ctypes 签名（HANDLE 是 64 位指针，缺签名会按默认 `c_int` 处理）；纯进程名匹配时跳过同进程的空标题与零客户区 helper 窗口，避免接管绑到看不见的副窗口。
+v0.4.17 增量深审（A794）修复：纯进程名模式授权提示与确认码绑定改用「标题 or 进程名」，两者都空时先拒绝、不再推送空目标授权码；只配 `game_process`、标题键省略时不再套用默认文明6；纯进程名查找优先前台窗口、再取客户区面积最大者；DPI 尝试标志改为完成后置位，`SYSTEM_AWARE` 补混合 DPI 警告；`capture_window_bmp` 用 `try/finally` 释放 DC/位图并统一行数校验；`LOCALAPPDATA` 为空时不再拼出相对路径找运营锁。
 
 ## 功能
 
@@ -106,8 +107,8 @@ v0.4.16 复查补强：给 DPI 查询 API 补齐 ctypes 签名（HANDLE 是 64 �
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `steam.game_window_title` | `civilization vi` | 游戏助手优先查找的窗口标题片段（不区分大小写）；键存在且留空时不做 PrintWindow 直抓，只截取进程匹配的前台窗口 |
-| `steam.game_process` | 空 | 可选的窗口进程名精确匹配（不区分大小写），如 `factorio.exe`；切换游戏时建议与标题一并修改。v0.4.15 起只填这一项（标题留空）也能截图/监控/接管：接管按该进程的可见窗口绑定目标 |
+| `steam.game_window_title` | `civilization vi` | 游戏助手优先查找的窗口标题片段（不区分大小写）；键存在且留空时不做 PrintWindow 直抓，只截取进程匹配的前台窗口。只配 `game_process` 时本键可留空或省略，不会继续套用默认文明6 |
+| `steam.game_process` | 空 | 可选的窗口进程名精确匹配（不区分大小写），如 `factorio.exe`；切换游戏时建议与标题一并修改。只填这一项（标题留空）时：接管会枚举该进程可见窗口并优先选前台；截图/监控只接受当前在前台的该进程窗口，后台时需先把游戏切到前台 |
 | `steam.require_friend_confirm` | `false` | 设为 `true` 时，所有好友发送（含精确昵称/SteamID）都必须经过用户界面确认码 |
 | `STEAM_MANAGER_DATA_DIR` | `%LOCALAPPDATA%\N.E.K.O\steam_manager` | 凭证加密存储目录覆盖 |
 | `STEAM_API_KEY` | 无 | 环境变量优先于本地配置文件 |
@@ -181,3 +182,16 @@ python -m plugin.neko_plugin_cli.cli build steam_manager
 - 真机（本机 Windows user32，非伪造）验证：宿主已 `SetProcessDPIAware` 后 `_is_dpi_aware()` 返回 True、`_ensure_dpi_awareness()` 返回 True 且 **0 次 Set 调用、0 条 warning**；`find_window_by_title("", "N.E.K.O.exe")` 命中真实窗口 `198240`（'Project N.E.K.O.'，客户区 2561×1601），黑名单 `explorer.exe` 与空标题窗口均被跳过；`find_window_by_title("", "")` 返回 None；`window_client_to_screen(500,500)` 得 `(1281, 801)`
 - Windows 完整测试：**172 passed in 4.09s**；`ruff check .`：**All checks passed**；官方 `check -r steam_manager` 通过
 - 仍未在真实 Steam 客户端 / 真实游戏 / 真实聊天接口上验证；上述真机结论只覆盖 Win32 窗口与 DPI 分支
+
+### v0.4.17 增量深审修复（A794）
+
+- 空标题授权：`take_control` 先用「标题 or 进程名」组成可读目标；两者都空时直接 `WINDOW_TARGET_REQUIRED`，不再先推送「允许 YUI 接管「」」；授权码签发、两段校验与最终消费都绑定同一目标
+- 只配进程名：`game_window_title` 键省略且 `game_process` 非空时，`on_startup` 不再保留默认 `civilization vi`；`config.example.toml` 与 README 同步说明“截图/监控要求目标在前台，只有接管会枚举”
+- 候选窗口顺序：纯进程名查找收齐所有通过 `is_game_like` 的候选，先取前台窗口，前台不匹配再取客户区面积最大者，避免同进程启动器/设置窗排在主窗口前
+- DPI 并发：`_DPI_AWARENESS_ATTEMPTED` 从“进锁先置位”改为 `finally` 完成后置位，避免第二个线程读到 True 却拿到旧的 `_DPI_AWARE=False`；`SYSTEM_AWARE(=1)` 保留已感知判定，但补一条混合 DPI 副屏坐标警告
+- GDI 清理：`capture_window_bmp` 的 BitBlt/GetDIBits 路径改用 `try/finally` 释放 DC 与位图，`create_string_buffer` 内存不足时不再泄漏句柄；行数判断与 PrintWindow 统一为 `copied == height`
+- 路径兜底：`_civ6_ops_yield` 先检查 `LOCALAPPDATA` 是否为空，避免拼出相对路径去当前目录误找 `civ6_ops_active`
+- 版本漂移：`__init__.py` docstring、`plugin.toml`、`pyproject.toml` 统一到 `0.4.17`
+- Windows 完整测试：**182 passed in 4.34s**（新增 `tests/test_v0417_regression.py` 10 项）；`ruff check . --exclude .venv`：**All checks passed**
+- 官方 `check -r steam_manager`：**passed**，`version=0.4.17`，`payload_hash_verified=True`，测试随检查通过
+- 仍未在真实 Steam 客户端 / 真实游戏窗口上复跑截图、点击与接管；本次结论来自源码核对与离线回归，不代表实机验证通过

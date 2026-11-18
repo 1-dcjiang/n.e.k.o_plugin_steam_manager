@@ -264,7 +264,16 @@ def _is_dpi_aware() -> bool:
         try:
             ctx = ctx_fn()
             if ctx:
-                return int(awareness_fn(ctx)) > 0
+                awareness = int(awareness_fn(ctx))
+                if awareness > 0:
+                    # SYSTEM_AWARE（1）只按主屏 DPI 缩放；混合 DPI 的副屏仍可能
+                    # 被系统换算。这里保留“已感知”判定，但明确提示需要复核副屏坐标。
+                    if awareness == 1:
+                        _logger.warning(
+                            "当前进程仅 SYSTEM_AWARE（DPI 感知=1）；多显示器不同 DPI 时"
+                            "副屏截图/点击坐标可能仍被系统缩放，请按实际 DPI 复核"
+                        )
+                    return True
         except (OSError, AttributeError, TypeError, ValueError, ctypes.ArgumentError):
             pass
     legacy = getattr(USER32, "IsProcessDPIAware", None)
@@ -291,35 +300,39 @@ def _ensure_dpi_awareness() -> bool:
     with _DPI_LOCK:
         if _DPI_AWARENESS_ATTEMPTED:
             return _DPI_AWARE
-        _DPI_AWARENESS_ATTEMPTED = True
-        # v0.4.15：宿主（或别的插件）可能已经设过感知，此时两个 Set* 都会返回 0
-        # ——0 只表示“没设成”，不代表没有感知。旧实现在这里把“已感知”误判成
-        # 失败并打两条误导性警告，故先查询现状，已感知直接算成功。
-        if _is_dpi_aware():
-            _DPI_AWARE = True
-            return True
-        for name, value in (
-            ("SetProcessDpiAwarenessContext", -4),
-            ("SetProcessDPIAware", None),
-        ):
-            fn = getattr(USER32, name, None)
-            if fn is None:
-                continue
-            try:
-                result = fn() if value is None else fn(ctypes.c_void_p(value))
-            except (OSError, AttributeError, ctypes.ArgumentError) as exc:
-                _logger.warning("设置 DPI awareness 失败（%s）：%s", name, exc)
-                continue
-            if result:
+        # v0.4.17：标志必须在工作完成后才置位。旧实现进锁先置 True，第二个线程
+        # 在锁外看到 True 就返回尚未更新的 _DPI_AWARE=False，第一帧可能按旧缩放算。
+        try:
+            # v0.4.15：宿主（或别的插件）可能已经设过感知，此时两个 Set* 都会返回 0
+            # ——0 只表示“没设成”，不代表没有感知。旧实现在这里把“已感知”误判成
+            # 失败并打两条误导性警告，故先查询现状，已感知直接算成功。
+            if _is_dpi_aware():
                 _DPI_AWARE = True
-                break
-            _logger.warning("设置 DPI awareness 返回 0（%s），继续尝试下一个 API", name)
-        if not _DPI_AWARE:
-            _logger.warning(
-                "没有可用的 DPI awareness API：高分屏下窗口坐标/点击位置可能被系统缩放，"
-                "截图与点击需要按实际 DPI 复核"
-            )
-        return _DPI_AWARE
+                return True
+            for name, value in (
+                ("SetProcessDpiAwarenessContext", -4),
+                ("SetProcessDPIAware", None),
+            ):
+                fn = getattr(USER32, name, None)
+                if fn is None:
+                    continue
+                try:
+                    result = fn() if value is None else fn(ctypes.c_void_p(value))
+                except (OSError, AttributeError, ctypes.ArgumentError) as exc:
+                    _logger.warning("设置 DPI awareness 失败（%s）：%s", name, exc)
+                    continue
+                if result:
+                    _DPI_AWARE = True
+                    break
+                _logger.warning("设置 DPI awareness 返回 0（%s），继续尝试下一个 API", name)
+            if not _DPI_AWARE:
+                _logger.warning(
+                    "没有可用的 DPI awareness API：高分屏下窗口坐标/点击位置可能被系统缩放，"
+                    "截图与点击需要按实际 DPI 复核"
+                )
+            return _DPI_AWARE
+        finally:
+            _DPI_AWARENESS_ATTEMPTED = True
 
 
 # ══════════ 窗口与进程信息 ══════════
@@ -443,34 +456,40 @@ def capture_window_bmp(info: dict, save_dir: str = _FRAME_DIR) -> str | None:
         USER32.ReleaseDC(None, hdc_screen)
         return None
     old = GDI32.SelectObject(hdc_mem, hbmp)
-    ok = GDI32.BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, left, top, 0x00CC0020)
-    if not ok:
-        GDI32.SelectObject(hdc_mem, old)
+    try:
+        ok = GDI32.BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, left, top, 0x00CC0020)
+        if not ok:
+            return None
+        # GetDIBits 取像素
+        bmi = _BitmapInfo()
+        bmi.bmiHeader.biSize = ctypes.sizeof(_BitmapInfoHeader)
+        bmi.bmiHeader.biWidth = width
+        bmi.bmiHeader.biHeight = -height  # 自上而下
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = _BI_RGB
+        row_size = (width * 4 + 3) & ~3
+        try:
+            buf = ctypes.create_string_buffer(row_size * height)
+        except MemoryError:
+            _logger.warning("截图缓冲区内存不足（%s×%s），放弃本帧", width, height)
+            return None
+        copied = GDI32.GetDIBits(
+            hdc_mem, hbmp, 0, height, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(bmi), 0
+        )
+        if copied != height:
+            _logger.warning("GetDIBits 只复制了 %s/%s 行，放弃本帧", copied, height)
+            return None
+        pixels = buf.raw
+    finally:
+        # v0.4.17：create_string_buffer 遇到超大窗口抛 MemoryError 时，原实现会跳过
+        # 后续清理，泄漏 DC/位图；这里把释放放进 finally，与 PrintWindow 路径对齐。
+        if old:
+            GDI32.SelectObject(hdc_mem, old)
         GDI32.DeleteObject(hbmp)
         GDI32.DeleteDC(hdc_mem)
         USER32.ReleaseDC(None, hdc_screen)
-        return None
-    # GetDIBits 取像素
-    bmi = _BitmapInfo()
-    bmi.bmiHeader.biSize = ctypes.sizeof(_BitmapInfoHeader)
-    bmi.bmiHeader.biWidth = width
-    bmi.bmiHeader.biHeight = -height  # 自上而下
-    bmi.bmiHeader.biPlanes = 1
-    bmi.bmiHeader.biBitCount = 32
-    bmi.bmiHeader.biCompression = _BI_RGB
-    row_size = (width * 4 + 3) & ~3
-    buf = ctypes.create_string_buffer(row_size * height)
-    copied = GDI32.GetDIBits(
-        hdc_mem, hbmp, 0, height, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(bmi), 0
-    )
-    GDI32.SelectObject(hdc_mem, old)
-    GDI32.DeleteObject(hbmp)
-    GDI32.DeleteDC(hdc_mem)
-    USER32.ReleaseDC(None, hdc_screen)
-    if copied != height:
-        _logger.warning("GetDIBits 只复制了 %s/%s 行，放弃本帧", copied, height)
-        return None
-    return _write_png(save_dir, width, height, buf.raw)
+    return _write_png(save_dir, width, height, pixels)
 
 
 def _write_png(save_dir: str, width: int, height: int, dib_pixels: bytes) -> str | None:
@@ -530,6 +549,9 @@ def find_window_by_title(title_hint: str, process_name: str = "") -> dict | None
     v0.4.15：标题为空、只给了 ``process_name`` 时按进程名匹配可见窗口（等价于
     “该进程的任意游戏窗口”），让“只配置 ``steam.game_process``”的配置对接管也
     成立；两者都为空仍然拒绝枚举，避免随便绑到一个前台窗口。
+
+    v0.4.17：纯进程名模式不再按枚举顺序取第一个命中，而是优先前台窗口，前台
+    不匹配时取客户区面积最大的候选，避免同进程启动器/设置窗排在主窗口前。
     """
     if USER32 is None:
         return None
@@ -539,6 +561,7 @@ def find_window_by_title(title_hint: str, process_name: str = "") -> dict | None
     if not hint and not expected_process:
         return None
     found: list[int] = []
+    process_candidates: list[dict] = []
 
     @_WNDENUMPROC
     def _enum(hwnd, _lparam):
@@ -582,11 +605,36 @@ def find_window_by_title(title_hint: str, process_name: str = "") -> dict | None
                 )
                 continue
         if is_game_like(info, process_name=process_name):
-            return info
+            if hint:
+                return info
+            # v0.4.17：纯进程名模式先收齐候选，不能按枚举顺序（大致 Z 序）直接返回。
+            # 同进程的启动器/设置窗/崩溃报告窗可能排在主窗口前，会把接管绑到副窗口；
+            # 稍后优先选前台窗口，前台不匹配再选客户区面积最大的窗口。
+            process_candidates.append(info)
+            continue
         _logger.info(
             "跳过标题匹配但非游戏进程的窗口：%r / %s", info["title"], info["process"] or "unknown"
         )
-    return None
+    if not process_candidates:
+        return None
+    fg_hwnd = 0
+    fg_fn = getattr(USER32, "GetForegroundWindow", None)
+    if fg_fn is not None:
+        try:
+            fg_hwnd = int(fg_fn() or 0)
+        except (OSError, TypeError, ValueError, ctypes.ArgumentError):
+            fg_hwnd = 0
+    for info in process_candidates:
+        if fg_hwnd and info.get("hwnd") == fg_hwnd:
+            return info
+
+    def _area(item: dict) -> int:
+        rect = item.get("client_rect")
+        if not rect:
+            return 0
+        return max(0, int(rect[2]) - int(rect[0])) * max(0, int(rect[3]) - int(rect[1]))
+
+    return max(process_candidates, key=_area)
 
 
 def find_civ6_window() -> dict | None:
@@ -627,12 +675,12 @@ def capture_window_printwindow(info: dict, save_dir: str = _FRAME_DIR) -> str | 
             hbmp = GDI32.CreateCompatibleBitmap(hdc_win, width, height)
             if not hbmp:
                 return None
+            old = None
             try:
                 old = GDI32.SelectObject(hdc_mem, hbmp)
                 if not USER32.PrintWindow(
                     hwnd, hdc_mem, _PW_RENDERFULLCONTENT | _PW_CLIENTONLY
                 ):
-                    GDI32.SelectObject(hdc_mem, old)
                     return None
                 bmi = _BitmapInfo()
                 bmi.bmiHeader.biSize = ctypes.sizeof(_BitmapInfoHeader)
@@ -642,15 +690,25 @@ def capture_window_printwindow(info: dict, save_dir: str = _FRAME_DIR) -> str | 
                 bmi.bmiHeader.biBitCount = 32
                 bmi.bmiHeader.biCompression = _BI_RGB
                 row_size = (width * 4 + 3) & ~3
-                buf = ctypes.create_string_buffer(row_size * height)
-                if not GDI32.GetDIBits(
-                    hdc_mem, hbmp, 0, height, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(bmi), 0
-                ):
-                    GDI32.SelectObject(hdc_mem, old)
+                try:
+                    buf = ctypes.create_string_buffer(row_size * height)
+                except MemoryError:
+                    _logger.warning(
+                        "PrintWindow 截图缓冲区内存不足（%s×%s），放弃本帧", width, height
+                    )
                     return None
-                GDI32.SelectObject(hdc_mem, old)
+                copied = GDI32.GetDIBits(
+                    hdc_mem, hbmp, 0, height, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(bmi), 0
+                )
+                if copied != height:
+                    _logger.warning(
+                        "PrintWindow GetDIBits 只复制了 %s/%s 行，放弃本帧", copied, height
+                    )
+                    return None
                 return _write_png(save_dir, width, height, buf.raw)
             finally:
+                if old:
+                    GDI32.SelectObject(hdc_mem, old)
                 GDI32.DeleteObject(hbmp)
         finally:
             GDI32.DeleteDC(hdc_mem)

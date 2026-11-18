@@ -1,4 +1,4 @@
-"""steam_manager — Steam 管理 + 游戏助手（v0.4.14）。
+"""steam_manager — Steam 管理 + 游戏助手（v0.4.17）。
 
 安全边界：只读本地库元数据；启动游戏需用户明确指令；截图与行为跟踪
 仅在用户开启监控后运行；键鼠接管（YUI 操作游戏）默认关闭，必须由
@@ -219,8 +219,13 @@ class SteamManagerPlugin(NekoPluginBase):
     _CIV6_OPS_LOCK_TTL = 300.0
 
     def _civ6_ops_yield(self) -> dict | None:
-        p = os.path.join(os.environ.get("LOCALAPPDATA", ""), "N.E.K.O", "config", "civ6_ops_active")
-        if not p or not os.path.isfile(p):
+        # v0.4.17：LOCALAPPDATA 为空时 os.path.join("", ...) 会得到相对路径，
+        # 原 if not p 永远为假，可能去当前目录误找运营锁。先确认环境变量存在。
+        local_appdata = (os.environ.get("LOCALAPPDATA") or "").strip()
+        if not local_appdata:
+            return None
+        p = os.path.join(local_appdata, "N.E.K.O", "config", "civ6_ops_active")
+        if not os.path.isfile(p):
             return None
         lock_ts: float | None = None
         try:
@@ -261,10 +266,14 @@ class SteamManagerPlugin(NekoPluginBase):
             _logger.warning("读取配置失败，使用默认窗口标题：%s", exc)
             cfg = {}
         steam_cfg = cfg.get("steam") if isinstance(cfg, dict) and isinstance(cfg.get("steam"), dict) else {}
+        self._game_process = str(steam_cfg.get("game_process") or "").strip()
         # 配置键存在时，空串也是明确选择：禁用 PrintWindow 直抓，不回退默认文明6。
         if "game_window_title" in steam_cfg:
             self._game_window_title = str(steam_cfg.get("game_window_title") or "").strip()
-        self._game_process = str(steam_cfg.get("game_process") or "").strip()
+        elif self._game_process:
+            # v0.4.17：只填 game_process、连 game_window_title 键都没写时，不应继续
+            # 套用默认 "civilization vi"；否则纯进程名配置会变成“标题+进程”双条件。
+            self._game_window_title = ""
         self._require_friend_confirm = _as_bool(
             steam_cfg.get("require_friend_confirm"), default=False
         )
@@ -1326,10 +1335,25 @@ class SteamManagerPlugin(NekoPluginBase):
         _y = self._civ6_ops_yield()
         if _y:
             return _y
+        hint = (self._game_window_title or "").strip()
+        process_name = getattr(self, "_game_process", "")
+        # v0.4.17：纯进程名模式下标题为空，授权提示和授权码不能再绑定到 ""。
+        # 用“标题 or 进程名”作为用户可读目标与确认码绑定值；两者都空则直接拒绝，
+        # 不再先推一个「允许 YUI 接管「」」的空目标确认码。
+        game_label = hint or process_name
+        if not game_label:
+            return {
+                "output": (
+                    "未配置 steam.game_window_title，也未配置 steam.game_process；"
+                    "接管需要明确的目标游戏窗口，已拒绝。请先配置游戏窗口标题或精确进程名。"
+                ),
+                "is_error": True,
+                "error": "WINDOW_TARGET_REQUIRED",
+            }
         if not grant_code:
-            _, code = self._issue_confirm("control", game=self._game_window_title)
+            _, code = self._issue_confirm("control", game=game_label)
             pushed = self._push_confirm_code(
-                f"允许 YUI 接管「{self._game_window_title}」的键鼠",
+                f"允许 YUI 接管「{game_label}」的键鼠",
                 "接管期间 YUI 可以点击和按键；你随时说「停止接管」即可收回。",
                 code,
             )
@@ -1350,23 +1374,12 @@ class SteamManagerPlugin(NekoPluginBase):
             }
         # 先只校验、不消费：窗口/前台/画面证据都通过前，码必须还能再用。
         if not self._consume_confirm(
-            grant_code, "control", consume=False, game=self._game_window_title
+            grant_code, "control", consume=False, game=game_label
         ):
             return {
                 "output": "授权码无效、已过期，或与当前游戏窗口不匹配。请重新发起授权。",
                 "is_error": True,
                 "error": "GRANT_CODE_INVALID",
-            }
-        hint = (self._game_window_title or "").strip()
-        process_name = getattr(self, "_game_process", "")
-        if not hint and not process_name:
-            return {
-                "output": (
-                    "未配置 steam.game_window_title，也未配置 steam.game_process；"
-                    "接管需要明确的目标游戏窗口，已拒绝。请先配置游戏窗口标题或精确进程名。"
-                ),
-                "is_error": True,
-                "error": "WINDOW_TARGET_REQUIRED",
             }
         # v0.4.15：只配置进程名时也要能接管。原来 hint 为空就直接 NO_WINDOW，
         # 而截图/监控都支持“仅进程名+前台过滤”，接管行为与它们不一致。
@@ -1397,7 +1410,7 @@ class SteamManagerPlugin(NekoPluginBase):
                 "error": "NO_WINDOW_EVIDENCE",
             }
         # 所有检查（含窗口证据）都通过后才真正消费一次性授权码；消费失败则回滚接管。
-        if not self._consume_confirm(grant_code, "control", game=self._game_window_title):
+        if not self._consume_confirm(grant_code, "control", game=game_label):
             self._state.disable_control()
             return {
                 "output": "授权码在检查期间失效了，请重新发起授权。",
